@@ -20,11 +20,12 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { dryRun, env, n8nApiBase, repairTimeoutMs, retryWaitMs } from './config.js';
+import { dryRun, env, repairTimeoutMs, retryWaitMs } from './config.js';
 import { runClaude } from './claude.js';
 import { errText, log, logError } from './log.js';
 import * as n8n from './n8n.js';
 import { context, prompt, snapshotOf } from './prompt.js';
+import { failedWriteNote, lastFailedWrite, readCallLog, wroteSuccessfully, writeHelperScripts } from './scripts.js';
 import { reportBoth } from './report.js';
 
 /**
@@ -257,7 +258,18 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
 
     /* 4. Claude Code, on a working directory holding the whole of what it was shown. */
     workspace = await mkdtemp(path.join(tmpdir(), 'repair-'));
-    const files = ['workflow.json', 'execution.json', 'failed-node.json', 'error.json', 'request.json'];
+
+    /**
+     * The two scripts are the only way the model reaches n8n (21 Sep 2026,
+     * after a live repair hand-rolled a curl and got a 401 on a working key).
+     * They carry the URL, the workflow id and the header themselves, and they
+     * log every call to `callLog`, which is read below: a write n8n refused is
+     * then a fact this service holds, not a claim the model makes about itself.
+     */
+    const helpers = await writeHelperScripts({ dir: workspace, workflowId });
+    const callLog = helpers.log;
+
+    const files = ['workflow.json', 'execution.json', 'failed-node.json', 'error.json', 'request.json', ...helpers.names];
     await Promise.all([
       writeFile(path.join(workspace, 'workflow.json'), JSON.stringify(wf, null, 2)),
       writeFile(path.join(workspace, 'execution.json'), JSON.stringify(exec, null, 2)),
@@ -273,7 +285,6 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       ctx,
       files,
       dryRun: isDryRun,
-      n8nApiBase: n8nApiBase(),
     });
 
     log(repairId, 'claude.start', { timeout_ms: repairTimeoutMs(), prompt_chars: text.length, cwd: workspace });
@@ -283,9 +294,11 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       timeoutMs: repairTimeoutMs(),
       tools: env('CLAUDE_ALLOWED_TOOLS') || 'Bash,Read,Write,Edit,Glob,Grep',
       extraEnv: {
+        // Only what the two scripts read. The model is told never to use these
+        // itself, and it has no reason to: the scripts send them.
         N8N_BASE_URL: process.env.N8N_BASE_URL ?? '',
         N8N_API_KEY: process.env.N8N_API_KEY ?? '',
-        N8N_API_BASE: n8nApiBase() ?? '',
+        N8N_CALL_LOG: callLog,
       },
       onLog: (detail) => log(repairId, 'claude.note', detail),
     });
@@ -297,13 +310,30 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       logError(repairId, 'claude.unparseable', { tail: (claudeRun.text || claudeRun.stderr || '').slice(-800) });
     }
 
+    /**
+     * What n8n actually answered, from the scripts' own log rather than from
+     * the model's account of the run. A refused write is carried into
+     * human_action whatever the model said about it.
+     */
+    const calls = await readCallLog(callLog);
+    const wrote = wroteSuccessfully(calls);
+    const refusedWrite = lastFailedWrite(calls);
+    log(repairId, 'n8n.calls', {
+      calls: calls.length,
+      wrote,
+      statuses: calls.map((c) => `${c.method} ${c.status}`),
+    });
+    if (refusedWrite) logError(repairId, 'n8n.write.refused', { status: refusedWrite.status, body: refusedWrite.body.slice(0, 400) });
+
     /* 5. What n8n says happened, which is the only thing that decides a repair. */
     let versionChanged = false;
     let retryRan = false;
     let retryPassed = false;
     let retryNote = null;
 
-    const looksChanged = Boolean(claimed && (claimed === 'repaired' || strings(result?.nodes_changed).length > 0));
+    // A write n8n accepted is reason enough to re-read, whatever the model
+    // claimed — including a run that ended without a parseable result.
+    const looksChanged = wrote || Boolean(claimed && (claimed === 'repaired' || strings(result?.nodes_changed).length > 0));
 
     if (isDryRun) {
       log(repairId, 'dry_run.no_writes', 'DRY_RUN is on: nothing was written to n8n and no retry was run.');
@@ -333,6 +363,7 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       const said = str(result?.change_summary) ?? (claudeRun.ok ? 'No change was reported.' : 'No change was reported: the run did not finish.');
       if (isDryRun) return `DRY RUN: ${said}`;
       const extra = [];
+      if (refusedWrite) extra.push(failedWriteNote(refusedWrite));
       if (retryNote) extra.push(retryNote);
       if (claimed === 'repaired' && !versionChanged) extra.push('Claude Code reported a repair, but n8n shows the same versionId as before it ran — so this is recorded as needing a person rather than as a repair.');
       if (claimed && claimed !== 'repaired' && outcome === 'repaired') {
@@ -343,7 +374,16 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
 
     const humanAction = (() => {
       const said = str(result?.human_action);
+      /**
+       * A write n8n refused goes on the row whether or not the model mentioned
+       * it. This is the case the scripts were built for: the status and the
+       * body are the two things a person needs, and they must not depend on the
+       * model having quoted them.
+       */
+      const refusal = refusedWrite ? failedWriteNote(refusedWrite) : null;
+      if (said && refusal && !said.includes(String(refusedWrite.status))) return `${refusal} ${said}`;
       if (said) return said;
+      if (refusal) return `${refusal} Look at the workflow in n8n and decide whether the fix above is worth applying by hand.`;
       if (outcome === 'needs_human' && !result) return 'Read this repair’s log on the bridge, then look at the workflow yourself: the run finished without saying what it found, so nothing here should be trusted as a diagnosis.';
       if (outcome === 'not_repaired') return 'The failure is still there. Look at the root cause above and decide whether it is worth fixing by hand.';
       return null;

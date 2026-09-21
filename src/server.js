@@ -59,12 +59,14 @@ export function createApp() {
      */
     try {
       const r = await reachable(deepHealthTimeoutMs());
-      log(null, 'health.deep', { claude_reachable: r.claude_reachable, model: r.model, ms: r.ms, error: r.error });
+      log(null, 'health.deep', { claude_reachable: r.claude_reachable, model: r.model, model_pinned: r.model_pinned, model_fallback: r.model_fallback, ms: r.ms, error: r.error });
       return res.json({
         ...base,
         ok: r.claude_reachable,
         claude_reachable: r.claude_reachable,
         model: r.model,
+        model_pinned: r.model_pinned,
+        model_fallback: r.model_fallback,
         said: r.said,
         checked_in_ms: r.ms,
         error: r.error,

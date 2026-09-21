@@ -12,6 +12,8 @@
  * passed — whatever the model says about itself.
  */
 
+import { GET_SCRIPT, PUT_SCRIPT } from './scripts.js';
+
 const MAX_INLINE = 6000;
 
 export function clip(value, max = MAX_INLINE) {
@@ -97,30 +99,46 @@ export function snapshotOf(workflow) {
  * The repair prompt.
  *
  * `dryRun` changes the job rather than dressing it up: in a dry run the model is
- * told it may not write to n8n at all, and the outcome it is asked for is the
- * diagnosis alone.
+ * told it may not run the write script at all, and the outcome it is asked for
+ * is the diagnosis alone.
+ *
+ * The n8n API key is never in this text, and neither is a URL to call: every
+ * read and write goes through the two scripts in the working directory. That is
+ * the whole point of them — see `scripts.js`.
  */
-export function prompt({ repairId, request, workflow, ctx, files, dryRun, n8nApiBase }) {
+export function prompt({ repairId, request, workflow, ctx, files, dryRun }) {
   const error = request?.error ?? {};
   const wf = request?.workflow ?? {};
   const exec = request?.execution ?? {};
 
   const writeRules = dryRun
-    ? `THIS IS A DRY RUN. You must NOT change anything in n8n. Do not POST, PUT, PATCH or
-DELETE anything — GET only. Diagnose the failure and describe the smallest fix you
-WOULD have made. Report the outcome as "not_repaired" and put the proposed change in
-change_summary.`
-    : `You may change this one workflow, through the n8n API, and only as far as the fix needs:
+    ? `THIS IS A DRY RUN. You must NOT change anything in n8n.
 
-  GET  ${n8nApiBase}/workflows/${wf.id}      (read it back before you write)
-  PUT  ${n8nApiBase}/workflows/${wf.id}      (the whole workflow; n8n has no partial update)
+  You may run ./${GET_SCRIPT} to read the workflow.
+  Do NOT run ./${PUT_SCRIPT} at all, and do not change anything by any other means.
 
-  curl is available. The key is in the environment as $N8N_API_KEY and the header is
-  X-N8N-API-KEY. Never print the key.
+  Diagnose the failure and describe the smallest fix you WOULD have made. Report
+  the outcome as "not_repaired" and put the proposed change in change_summary.`
+    : `HOW TO REACH n8n
+Two scripts in your working directory are the ONLY way to reach it:
 
-  A PUT replaces the workflow, so send back everything you read — name, nodes,
-  connections, settings — with only your fix changed. Do NOT send "active": changing
-  whether a live workflow runs is a second change nobody asked for.`;
+  ./${GET_SCRIPT}                 prints this workflow as JSON
+  ./${PUT_SCRIPT} <file.json>     sends it back; prints "HTTP <status>" and n8n's answer
+
+  Do NOT write your own curl, and do not use an API key yourself. The scripts
+  hold the URL, the workflow id and the authentication and send it themselves —
+  a hand-written call is how the last repair failed with a 401 on a key that
+  works. There is no other n8n endpoint for you to call.
+
+  The PUT sends only name, nodes, connections and settings, because n8n rejects
+  a body carrying anything else — so save the WHOLE workflow with your fix
+  applied to a file and pass that file. The script drops the rest for you.
+
+  After a write, run ./${GET_SCRIPT} again and read back what landed.
+
+  If the PUT prints a status outside 2xx, the write did NOT happen: the workflow
+  is unchanged. Say so in human_action, quoting the status and the body it
+  printed, and report "needs_human" rather than "repaired".`;
 
   return `You are repairing one failed n8n workflow for Bays Horizon Advisory. Repair id ${repairId}.
 
@@ -146,11 +164,13 @@ ${clip(ctx.input, 3000)}
 WHAT THE NODE PRODUCED
 ${clip(ctx.output, 2000)}
 
-FILES IN YOUR WORKING DIRECTORY (the whole thing, where the above was cut short)
+IN YOUR WORKING DIRECTORY
 ${files.map((f) => `  ${f}`).join('\n')}
+The JSON files hold the whole of what was cut short above. The two .sh scripts
+are how you read and write the workflow — see below.
 
 THE JOB
-1. Find the root cause. Read the files; the execution data is all there.
+1. Find the root cause. Read the JSON files; the execution data is all there.
 2. Make the SMALLEST fix that addresses that root cause. One node's parameters,
    an expression, a wrong field name — that size of change.
 
@@ -162,7 +182,8 @@ RULES YOU MAY NOT BREAK
   - Never touch credentials. Not the credential a node uses, not its id, not its name.
     If the cause is a credential, that is a person's job: say so in human_action.
   - Never activate or deactivate a workflow.
-  - Never change a workflow other than ${wf.id ?? 'the one named above'}.
+  - Never change a workflow other than ${wf.id ?? 'the one named above'} — the scripts
+    reach only that one, and there is no way around them worth looking for.
   - Do not fix a symptom you cannot explain. If you cannot find the root cause, say so
     and report "needs_human" — a guess written into a live workflow is worse than a
     failure somebody can see.

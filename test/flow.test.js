@@ -22,6 +22,7 @@ const WORKFLOW = {
     { name: 'Map fields', type: 'n8n-nodes-base.set', parameters: { values: { string: [{ name: 'x', value: '={{ $json.missing }}' }] } } },
   ],
   connections: { Webhook: { main: [[{ node: 'Map fields', type: 'main', index: 0 }]] } },
+  settings: { executionOrder: 'v1' },
 };
 
 const EXECUTION = {
@@ -40,15 +41,24 @@ const EXECUTION = {
 };
 
 /** A minimal n8n. `changes` decides whether the workflow's version moves after the run. */
-function stubN8n({ changes, retryStatus = 'success', retryAnswer = { id: '100' } }) {
-  const seen = { workflowReads: 0, retries: 0 };
+function stubN8n({ changes, retryStatus = 'success', retryAnswer = { id: '100' }, putStatus = 200 }) {
+  const seen = { workflowReads: 0, retries: 0, puts: [] };
   const server = createServer((req, res) => {
     const url = new URL(req.url, 'http://n8n');
+    let raw = '';
+    req.on('data', (d) => (raw += d));
     const send = (code, body) => {
       res.writeHead(code, { 'content-type': 'application/json' });
       res.end(JSON.stringify(body));
     };
     if (req.headers['x-n8n-api-key'] !== 'n8n-key') return send(401, { message: 'no key' });
+
+    if (url.pathname === '/api/v1/workflows/wf1' && req.method === 'PUT') {
+      return req.on('end', () => {
+        seen.puts.push(JSON.parse(raw || '{}'));
+        send(putStatus, putStatus < 300 ? { id: 'wf1', versionId: 'v2' } : { message: 'unauthorized' });
+      });
+    }
 
     if (url.pathname === '/api/v1/workflows/wf1') {
       seen.workflowReads++;
@@ -92,14 +102,21 @@ const listen = (server) =>
   });
 
 /** A `claude` that prints what we want it to have said, in the CLI's own envelope. */
-async function fakeClaude(answer) {
+async function fakeClaude(answer, shellBody = '') {
   const dir = await mkdtemp(path.join(tmpdir(), 'fake-claude-'));
   const bin = path.join(dir, 'claude');
   const envelope = JSON.stringify({ type: 'result', subtype: 'success', result: answer, modelUsage: { 'anthropic/claude-sonnet-4.5': {} } });
-  await writeFile(bin, `#!/bin/sh\ncat > /dev/null\ncat <<'ENVELOPE'\n${envelope}\nENVELOPE\n`);
+  await writeFile(bin, `#!/bin/sh\ncat > /dev/null\n${shellBody}\ncat <<'ENVELOPE'\n${envelope}\nENVELOPE\n`);
   await chmod(bin, 0o755);
   return bin;
 }
+
+/** What a run that uses the helper scripts does, as a fake CLI would do it. */
+const USES_THE_SCRIPTS = [
+  './n8n-get-workflow.sh > read-back.json 2>/dev/null || true',
+  'cp read-back.json fixed.json 2>/dev/null || cp workflow.json fixed.json',
+  './n8n-put-workflow.sh fixed.json > put-output.txt 2>&1 || true',
+].join('\n');
 
 const REQUEST = {
   lane: 'bays',
@@ -113,8 +130,8 @@ const REQUEST = {
 };
 
 /** Boots the bridge with the stubs wired in, runs one request, and returns both reports. */
-async function runOnce({ answer, changes = true, retryStatus = 'success', dry = false, retryAnswer, request = REQUEST, apiKey = 'bridge-key', extraPost = null }) {
-  const n8n = stubN8n({ changes, retryStatus, retryAnswer });
+async function runOnce({ answer, changes = true, retryStatus = 'success', dry = false, retryAnswer, putStatus = 200, shellBody = '', request = REQUEST, apiKey = 'bridge-key', extraPost = null }) {
+  const n8n = stubN8n({ changes, retryStatus, retryAnswer, putStatus });
   const dashboard = collector();
   const webhook = collector();
   const [n8nUrl, dashboardUrl, webhookUrl] = await Promise.all([listen(n8n.server), listen(dashboard.server), listen(webhook.server)]);
@@ -126,7 +143,7 @@ async function runOnce({ answer, changes = true, retryStatus = 'success', dry = 
   process.env.DASHBOARD_INBOUND_KEY = 'dash-key';
   process.env.REPORT_WEBHOOK_URL = webhookUrl;
   process.env.SLACK_REPORT_CHANNEL = '#bha-pipeline-errors';
-  process.env.CLAUDE_BIN = await fakeClaude(answer);
+  process.env.CLAUDE_BIN = await fakeClaude(answer, shellBody);
   process.env.DRY_RUN = dry ? 'true' : 'false';
   process.env.RETRY_WAIT_MS = '5000';
   process.env.REPAIR_TIMEOUT_MS = '20000';
@@ -265,4 +282,40 @@ test('a second request for a workflow already being repaired is skipped and says
   const skipped = r.all.dashboard.map((x) => x.body).find((b) => b.outcome === 'skipped');
   assert.ok(skipped, 'the skip was reported');
   assert.match(skipped.root_cause, /already running \(REP-wf1-99\)/);
+});
+
+test('a write n8n refused is on the row, with its status, whatever the model claimed', async () => {
+  const r = await runOnce({ answer: REPAIRED, shellBody: USES_THE_SCRIPTS, putStatus: 401, changes: false });
+
+  assert.equal(r.dashboard.body.outcome, 'needs_human', 'a refused write is never a repair');
+  assert.equal(r.dashboard.body.version_after, null);
+  assert.match(r.dashboard.body.human_action, /HTTP 401/);
+  assert.match(r.dashboard.body.human_action, /refused/i);
+  assert.match(r.dashboard.body.change_summary, /refused \(HTTP 401\)/);
+  assert.equal(r.n8n.retries, 0, 'nothing is retried when nothing was written');
+});
+
+test('a write that landed goes through the scripts, carrying only the four keys', async () => {
+  const r = await runOnce({ answer: REPAIRED, shellBody: USES_THE_SCRIPTS });
+
+  assert.equal(r.dashboard.body.outcome, 'repaired');
+  assert.equal(r.n8n.puts.length, 1, 'the put script was used, not a hand-rolled call');
+  assert.deepEqual(Object.keys(r.n8n.puts[0]).sort(), ['connections', 'name', 'nodes', 'settings']);
+  assert.equal('active' in r.n8n.puts[0], false);
+  assert.equal(r.dashboard.body.version_after, 'v2');
+});
+
+test('a run that wrote but said nothing readable is needs_human, with the version change recorded', async () => {
+  const r = await runOnce({ answer: 'I had a look and made a change.', shellBody: USES_THE_SCRIPTS });
+
+  assert.equal(r.dashboard.body.outcome, 'needs_human');
+  assert.equal(r.n8n.puts.length, 1);
+  assert.equal(r.dashboard.body.version_after, 'v2', 'the write is recorded even though the account of it is not');
+  assert.match(r.dashboard.body.root_cause, /without a parseable result/);
+});
+
+test('DRY_RUN gives the model the scripts but the prompt forbids the write', async () => {
+  const r = await runOnce({ answer: REPAIRED, dry: true, shellBody: './n8n-get-workflow.sh > /dev/null 2>&1 || true' });
+  assert.equal(r.dashboard.body.outcome, 'not_repaired');
+  assert.equal(r.n8n.puts.length, 0);
 });
