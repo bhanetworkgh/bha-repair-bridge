@@ -175,7 +175,7 @@ Your last output must be one JSON object and nothing after it:
   "root_cause": "what actually went wrong, in a sentence or two",
   "change_summary": "exactly what you changed, or what you would change",
   "nodes_changed": ["node name", ...],
-  "human_action": "what a person should do, or \\"\\" if nothing"
+  "human_action": "what a person should do, or an empty string if nothing"
 }
 
 "repaired" means you changed the workflow and believe the failure is fixed. It is
