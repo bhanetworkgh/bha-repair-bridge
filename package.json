@@ -1,0 +1,19 @@
+{
+  "name": "bha-repair-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Always-on service that repairs failed n8n workflows with Claude Code headless and reports the result.",
+  "type": "module",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-code": "^1.0.0",
+    "express": "^4.21.2"
+  }
+}
