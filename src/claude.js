@@ -20,6 +20,21 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { claudeModel, env } from './config.js';
 
+/**
+ * The model a run asks OpenRouter for.
+ *
+ * Pinned, because the CLI's own default resolved to `claude-sonnet-4-20250514`
+ * on this account — a Sonnet from May 2025 doing repairs in September 2026.
+ * `ANTHROPIC_MODEL` on the service overrides this without a release, and
+ * `GET /health?deep=1` reports the model that actually served the request, so a
+ * name OpenRouter does not know shows up there rather than inside a repair.
+ */
+export const DEFAULT_MODEL = 'claude-sonnet-5';
+
+export function model() {
+  return env('ANTHROPIC_MODEL') || DEFAULT_MODEL;
+}
+
 /** Where the CLI is: an override, then this package's own copy, then PATH. */
 export function claudeBin() {
   const override = env('CLAUDE_BIN');
@@ -39,6 +54,7 @@ function childEnv(extra = {}) {
     ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL ?? '',
     ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN ?? '',
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? '',
+    ANTHROPIC_MODEL: model(),
     // Keep the CLI quiet and non-interactive.
     CI: '1',
     DISABLE_AUTOUPDATER: '1',
@@ -75,21 +91,47 @@ export const DEFAULT_PERMISSION_MODE = 'acceptEdits';
 const ROOT_REFUSAL = /root\/sudo privileges/i;
 
 /**
+ * An answer that means the model name itself was refused — a 404 or
+ * not_found_error from OpenRouter naming the model, rather than anything the
+ * run did.
+ */
+const UNKNOWN_MODEL = /(not_found_error|404).*model|model.*(not found|not_found_error|is not a valid|unknown)/i;
+
+/**
  * One headless run, with one retry: a CLI that refused the permission mode
  * because the process is root is re-run under the mode it will accept, rather
  * than reported as a repair that could not start.
  */
 export async function runClaude(options) {
   const first = await spawnClaude(options);
+  if (first.ok) return first;
+
+  const said = `${first.error ?? ''} ${first.stderr ?? ''}`;
+
   const mode = env('CLAUDE_PERMISSION_MODE') || DEFAULT_PERMISSION_MODE;
-  if (first.ok || !options.tools || mode === DEFAULT_PERMISSION_MODE) return first;
-  if (!ROOT_REFUSAL.test(`${first.error ?? ''} ${first.stderr ?? ''}`)) return first;
-  options.onLog?.(`the CLI refused --permission-mode ${mode} for running as root; retrying under ${DEFAULT_PERMISSION_MODE}`);
-  const second = await spawnClaude({ ...options, permissionMode: DEFAULT_PERMISSION_MODE });
-  return { ...second, ms: second.ms + first.ms };
+  if (options.tools && mode !== DEFAULT_PERMISSION_MODE && ROOT_REFUSAL.test(said)) {
+    options.onLog?.(`the CLI refused --permission-mode ${mode} for running as root; retrying under ${DEFAULT_PERMISSION_MODE}`);
+    const second = await spawnClaude({ ...options, permissionMode: DEFAULT_PERMISSION_MODE });
+    return { ...second, ms: second.ms + first.ms };
+  }
+
+  /**
+   * A pinned model the provider does not know, retried once on the CLI's own
+   * default — but only where the run produced nothing at all, which is what a
+   * refusal at the first API call looks like. A run that had already started
+   * doing things is never re-run: it may have written to n8n, and doing that
+   * twice is worse than reporting one failure.
+   */
+  if (!first.text && UNKNOWN_MODEL.test(said)) {
+    options.onLog?.(`the provider does not know the model ${model()}; retrying on the CLI's own default`);
+    const second = await spawnClaude({ ...options, modelOverride: '' });
+    return { ...second, ms: second.ms + first.ms, modelFallback: true };
+  }
+
+  return first;
 }
 
-function spawnClaude({ prompt, cwd, timeoutMs, tools = null, permissionMode = null, extraEnv = {}, onLog = () => {} }) {
+function spawnClaude({ prompt, cwd, timeoutMs, tools = null, permissionMode = null, modelOverride = null, extraEnv = {}, onLog = () => {} }) {
   const bin = claudeBin();
   const args = ['-p', '--output-format', 'json'];
 
@@ -105,11 +147,17 @@ function spawnClaude({ prompt, cwd, timeoutMs, tools = null, permissionMode = nu
   const extra = env('CLAUDE_EXTRA_ARGS');
   if (extra) args.push(...extra.split(/\s+/).filter(Boolean));
 
+  const environment = childEnv(extraEnv);
+  // An empty modelOverride means "let the CLI choose", which is what the
+  // unknown-model fallback needs; null means "use the pinned one".
+  if (modelOverride === '') delete environment.ANTHROPIC_MODEL;
+  else if (modelOverride) environment.ANTHROPIC_MODEL = modelOverride;
+
   return new Promise((resolve) => {
     const started = Date.now();
     let child;
     try {
-      child = spawn(bin, args, { cwd, env: childEnv(extraEnv), stdio: ['pipe', 'pipe', 'pipe'] });
+      child = spawn(bin, args, { cwd, env: environment, stdio: ['pipe', 'pipe', 'pipe'] });
     } catch (e) {
       resolve({ ok: false, text: '', stderr: '', model: null, error: `Claude Code could not be started (${bin}): ${e instanceof Error ? e.message : String(e)}`, timedOut: false, code: null, ms: 0 });
       return;
@@ -216,6 +264,9 @@ export async function reachable(timeoutMs) {
   const ok = r.ok && !r.error && /\bok\b/i.test(said);
   return {
     claude_reachable: ok,
+    /** What the run was asked for, and what answered — they differ when the pin is wrong. */
+    model_pinned: model(),
+    model_fallback: Boolean(r.modelFallback),
     model: r.model,
     said: said ? said.slice(0, 200) : null,
     ms: r.ms,

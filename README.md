@@ -47,7 +47,7 @@ request ends in a reported outcome. Silence is the one forbidden result.
 | | |
 |---|---|
 | `GET /health` | `{ ok, busy, dry_run, env_missing }`. Answers before a single secret is set — that is how anybody finds out which ones are still missing |
-| `GET /health?deep=1` | Runs `claude -p "reply with the single word OK"` with no tools and a 60s limit, and returns `{ ok, claude_reachable, model, error }`. **This is the proof that Claude Code reaches OpenRouter on this key**, and it is the thing to run before trusting a repair |
+| `GET /health?deep=1` | Runs `claude -p "reply with the single word OK"` with no tools and a 60s limit, and returns `{ ok, claude_reachable, model, model_pinned, model_fallback, error }`. **This is the proof that Claude Code reaches OpenRouter on this key**, and it is the thing to run before trusting a repair. `model` is what actually served the request — check it against `model_pinned` |
 | `POST /fix-workflow` | One repair request. `x-api-key` must equal `BRIDGE_KEY`, else 401. Answers `202 { accepted: true, repair_id }` and does the work afterwards |
 | `GET /repairs/active` | What is running right now, by repair id. For when a repair seems stuck |
 
@@ -91,16 +91,53 @@ second.
 2. **Read.** `GET /workflows/{id}` — `version_before` is its `versionId` — and
    `GET /executions/{id}?includeData=true`.
 3. **Diagnose.** Claude Code runs in a scratch directory holding `workflow.json`,
-   `execution.json`, `failed-node.json`, `error.json` and `request.json`, with a
-   prompt carrying the error, the failed node's configuration, and what reached
-   it and what it produced. It is told to find the root cause, make the
-   **smallest** fix, and never rename or delete a node, never touch credentials,
-   never activate or deactivate a workflow. Ten minutes, hard.
+   `execution.json`, `failed-node.json`, `error.json`, `request.json` and the
+   **two helper scripts below**, with a prompt carrying the error, the failed
+   node's configuration, and what reached it and what it produced. It is told to
+   find the root cause, make the **smallest** fix, and never rename or delete a
+   node, never touch credentials, never activate or deactivate a workflow. Ten
+   minutes, hard.
 4. **Verify.** If it changed something: re-read the workflow for
    `version_after`, then `POST /executions/{id}/retry {loadWorkflow:true}` and
    wait for the retry's final status. Success → `repaired`. Anything else →
    `not_repaired`, with the reason on the row.
 5. **Report**, twice.
+
+### The model does not write n8n calls
+
+**Added 21 September 2026, after the first live repairs.** The first one saved
+fine; the second came back `401` from n8n *on the same key that had just
+worked* — the model had written its own `curl` and got the authentication
+wrong. The key was never the problem; the hand-rolled call was.
+
+So there are no n8n calls left to get wrong. Two scripts are written into every
+repair's working directory, and the prompt says they are the only way to reach
+n8n:
+
+| | |
+|---|---|
+| `./n8n-get-workflow.sh` | `GET /api/v1/workflows/{id}` — prints the workflow as JSON. No arguments: the id is baked in |
+| `./n8n-put-workflow.sh <file.json>` | `PUT /api/v1/workflows/{id}` — prints `HTTP <status>` and n8n's body, and exits non-zero on anything but 2xx |
+
+- **The key is never in the prompt** — not its value, not even the name of the
+  variable. There is no URL to call and no `curl` to copy. The scripts read
+  `N8N_BASE_URL` and `N8N_API_KEY` from their own environment and send
+  `X-N8N-API-KEY` themselves.
+- **The PUT sends only `name`, `nodes`, `connections` and `settings`.** n8n
+  rejects a body carrying the read-only fields it hands out (`id`, `versionId`,
+  `active`, `createdAt`, `tags`), so the script drops them — the model saves the
+  whole workflow with its fix applied and passes that file. `active` is never
+  sent for the second reason too: a write that switched a live workflow on or
+  off would be a change nobody asked for.
+- **A fragment is refused, not sent.** A file missing `name`, `nodes` or
+  `connections`, or one that is not valid JSON, exits 2 and says which.
+- **Every call is logged, and the bridge reads that log.** A write n8n refused
+  goes onto `human_action` with its status and body *whether or not the model
+  mentioned it* — and the outcome downgrades accordingly. This is the guard the
+  401 taught us to want: what n8n answered is a fact this service holds, not a
+  claim the model makes about itself.
+
+### Permissions and the model
 
 Claude Code is given its tools by name — `Bash`, `Read`, `Write`, `Edit`,
 `Glob`, `Grep` — under `--permission-mode acceptEdits`, **not**
@@ -167,7 +204,7 @@ may only read, no retry is run, and the outcome is `not_repaired` with
 ```sh
 npm ci
 npm start          # PORT, or 10000
-npm test           # the outcome rules, the HTTP surface, and the whole flow against stubs
+npm test           # the outcome rules, the helper scripts, the HTTP surface, and the whole flow against stubs
 ```
 
 On Render (service `bha-repair-bridge`):
@@ -194,7 +231,8 @@ otherwise. It works whether or not the global install is on `PATH` at runtime.
 | `ANTHROPIC_AUTH_TOKEN` | The OpenRouter key Claude Code runs on |
 | `ANTHROPIC_API_KEY` | **Deliberately empty.** Set, Claude Code would use it instead of the auth token. There is no cached Anthropic login in the container and none should be added |
 | `DRY_RUN` | Optional, default false |
-| `CLAUDE_MODEL` | Optional. Unset, Claude Code picks its own default |
+| `ANTHROPIC_MODEL` | The model Claude Code runs on. Defaults to **`claude-sonnet-5`** — the CLI's own default resolved to `claude-sonnet-4-20250514` (a Sonnet from May 2025) on this account. Set it on Render to move the pin without a release; if OpenRouter does not know the name, the run falls back to the CLI's default and `/health?deep=1` reports both |
+| `CLAUDE_MODEL` | Optional. Passed as `--model`, and wins over `ANTHROPIC_MODEL` when set |
 | `CLAUDE_PERMISSION_MODE` | Optional, default `acceptEdits`. `bypassPermissions` only where the service does not run as root — the CLI refuses it there |
 | `CLAUDE_ALLOWED_TOOLS` | Optional, default `Bash,Read,Write,Edit,Glob,Grep` |
 | `CLAUDE_BIN` | Optional. Overrides where the CLI is found |
@@ -232,5 +270,6 @@ the body it could not deliver.
 | `src/n8n.js` | The n8n API: read a workflow, read an execution, retry one, wait for it |
 | `src/claude.js` | Running the CLI headless, and reading its envelope |
 | `src/prompt.js` | What Claude Code is told and what it is given to read |
+| `src/scripts.js` | The two n8n helper scripts, their call log, and what a refused write means |
 | `src/report.js` | Both reports, with retries, and the loud log when one will not send |
 | `src/config.js` | Every environment variable, read through functions so `/health` is current |

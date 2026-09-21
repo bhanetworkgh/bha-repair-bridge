@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { decideOutcome, extractResult, isRefusedWorkflow, normalizeName, repairIdFor, REFUSED_WORKFLOWS } from '../src/repair.js';
 import { readEnvelope } from '../src/claude.js';
-import { upstreamOf, context, snapshotOf } from '../src/prompt.js';
+import { upstreamOf, context, snapshotOf, prompt } from '../src/prompt.js';
 
 test('the repair id is the workflow and the execution', () => {
   assert.equal(repairIdFor({ workflow: { id: 'abc' }, execution: { id: '42' } }), 'REP-abc-42');
@@ -139,4 +139,28 @@ test('the snapshot carries the nodes and connections a revert restores from', ()
   assert.equal(s.nodes.length, 2);
   assert.ok(s.connections.Webhook);
   assert.equal(snapshotOf({ id: 'x' }), null);
+});
+
+test('the prompt never carries the n8n key, a URL to call, or a curl to copy', () => {
+  process.env.N8N_API_KEY = 'n8n_api_key_that_must_not_leak';
+  process.env.N8N_BASE_URL = 'https://n8n.example';
+
+  const ctx = { nodeName: 'Map fields', node: {}, nodeError: null, output: [], input: {}, upstream: [] };
+  const request = { workflow: { id: 'wf1', name: 'Bays — Slack Router' }, execution: { id: '99' }, error: { class: 'expression_error', message: 'boom' } };
+  const files = ['workflow.json', 'n8n-get-workflow.sh', 'n8n-put-workflow.sh'];
+
+  for (const dryRun of [false, true]) {
+    const text = prompt({ repairId: 'REP-wf1-99', request, workflow: {}, ctx, files, dryRun });
+    assert.equal(text.includes('n8n_api_key_that_must_not_leak'), false, 'the key is never in the prompt');
+    assert.equal(/N8N_API_KEY/.test(text), false, 'not even the name of the variable, so there is nothing to reach for');
+    assert.equal(/curl /.test(text), false, 'no curl to copy and get wrong');
+    assert.equal(/https?:\/\//.test(text), false, 'no endpoint to call directly');
+    assert.match(text, /n8n-get-workflow\.sh/);
+  }
+
+  // The write script is offered on a real repair and forbidden on a dry run.
+  const live = prompt({ repairId: 'R', request, workflow: {}, ctx, files, dryRun: false });
+  const dry = prompt({ repairId: 'R', request, workflow: {}, ctx, files, dryRun: true });
+  assert.match(live, /n8n-put-workflow\.sh <file\.json>/);
+  assert.match(dry, /Do NOT run \.\/n8n-put-workflow\.sh/);
 });
