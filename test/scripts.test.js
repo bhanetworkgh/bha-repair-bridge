@@ -180,3 +180,13 @@ test('the call log ignores a line it cannot read rather than inventing one', () 
   assert.equal(log.length, 2);
   assert.equal(log[1].status, 401);
 });
+
+test('the last write is what is reported, not any failure along the way', () => {
+  const refusedThenFixed = parseCallLog(['a\tPUT\t400\tbad body', 'b\tPUT\t200\t{"versionId":"v2"}'].join('\n'));
+  assert.equal(lastFailedWrite(refusedThenFixed), null, 'a write that was fixed and landed has nothing left to report');
+  assert.equal(wroteSuccessfully(refusedThenFixed), true);
+
+  const landedThenRefused = parseCallLog(['a\tPUT\t200\t{"versionId":"v2"}', 'b\tPUT\t401\tunauthorized'].join('\n'));
+  assert.equal(lastFailedWrite(landedThenRefused).status, 401, 'a later refusal is still a change that did not land');
+  assert.equal(wroteSuccessfully(landedThenRefused), true, 'and the earlier write did happen');
+});
