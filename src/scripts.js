@@ -174,11 +174,18 @@ export function wroteSuccessfully(entries) {
   return entries.some((e) => e.method === 'PUT' && ok(e.status));
 }
 
-/** The last write that n8n refused, where the repair ended without a successful one. */
+/**
+ * The last write, where n8n refused it.
+ *
+ * The *last* one rather than any failed one: a repair that wrote, was refused,
+ * fixed the body and wrote again has nothing left to report, while one that
+ * wrote successfully and then failed on a second attempt does — its final
+ * intent did not land, and the row should say so.
+ */
 export function lastFailedWrite(entries) {
   const puts = entries.filter((e) => e.method === 'PUT');
-  if (puts.length === 0 || wroteSuccessfully(puts)) return null;
-  return puts[puts.length - 1];
+  const last = puts[puts.length - 1];
+  return last && !ok(last.status) ? last : null;
 }
 
 /** The sentence a person needs when a write was refused: the status, and what n8n said. */
@@ -186,5 +193,5 @@ export function failedWriteNote(entry) {
   if (!entry) return null;
   const status = entry.status === 0 ? 'no answer at all' : `HTTP ${entry.status}`;
   const body = entry.body ? ` n8n said: ${entry.body.slice(0, 600)}` : ' n8n returned no body.';
-  return `The write to n8n was refused (${status}), so the workflow was not changed.${body}`;
+  return `The last write to n8n was refused (${status}), so that change did not land.${body}`;
 }
