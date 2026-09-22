@@ -63,6 +63,33 @@ saved. Four things changed:
    too corrupt to read is still reported — knowing a repair was running is
    reason enough to tell somebody.
 
+### What one run costs, and what the instance needs
+
+Measured on this build, with `ps` sampling the whole process tree every 500 ms:
+
+| | |
+|---|---|
+| The bridge, idle | **65 MB** |
+| One Claude Code run, peak | **231 MB** |
+| Three runs at once, plus the bridge | **750 MB** |
+
+A starter instance is 512 MB, which is why 22 September ended the way it did:
+three concurrent runs need more memory than the instance has, and the kernel
+took the whole service rather than one run. With the queue, the working set is
+one run plus the bridge — **about 300 MB**.
+
+**That 231 MB is a floor, not a typical run.** These processes never reached a
+model: the measurement covers the CLI's own footprint (node, its bundle, agent
+startup) without a conversation, tool output or a large workflow JSON growing in
+memory. A real ten-minute repair should be read as **250–400 MB**, which puts a
+single run plus the bridge at **315–465 MB against a 512 MB limit** — it fits,
+with no room for a large workflow or a second process.
+
+**So the instance should move up from starter.** Standard (2 GB) leaves a real
+run four to six times the headroom it needs and makes the memory question
+uninteresting, which is the right state for a service whose whole job is to be
+reliable when something else has already broken.
+
 ## The four rules that decide an outcome
 
 1. **`repaired` is evidence, not a claim.** It is recorded only where n8n's own
