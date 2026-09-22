@@ -38,6 +38,8 @@ test('/health answers before a single secret is set, and names the ones that are
   assert.equal(r.status, 200);
   assert.equal(r.body.ok, true);
   assert.equal(r.body.busy, 0);
+  assert.equal(r.body.running, 0);
+  assert.equal(r.body.queued, 0);
   assert.equal(r.body.dry_run, false);
   assert.deepEqual(r.body.env_missing, ['BRIDGE_KEY', 'N8N_BASE_URL', 'N8N_API_KEY', 'DASHBOARD_URL', 'DASHBOARD_INBOUND_KEY', 'REPORT_WEBHOOK_URL', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN']);
 });
@@ -57,7 +59,8 @@ test('the wrong key is 401 and the right one is 202', async () => {
   // Refused by name, so this one accepts and skips without reaching n8n.
   const ok = await post('/fix-workflow', { workflow: { id: 'a', name: 'BHA — Self Healer' }, execution: { id: 'b' } }, { 'x-api-key': 'secret' });
   assert.equal(ok.status, 202);
-  assert.deepEqual(ok.body, { accepted: true, repair_id: 'REP-a-b' });
+  assert.equal(ok.body.accepted, true);
+  assert.equal(ok.body.repair_id, 'REP-a-b');
 
   delete process.env.BRIDGE_KEY;
 });

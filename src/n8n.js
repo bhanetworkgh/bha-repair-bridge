@@ -1,14 +1,17 @@
 /**
  * The n8n public API, as this bridge uses it.
  *
- * Four calls: read a workflow, read an execution with its data, retry an
- * execution, and list a workflow's executions (only as the fallback for a retry
- * that did not say which execution it started).
+ * Reads: a workflow, an execution with its data, and a workflow's executions
+ * (only as the fallback for a retry that did not say which execution it
+ * started). Two writes, both narrow: retrying the failed execution, and putting
+ * a workflow's active state back.
  *
- * The bridge itself never edits a workflow. The only thing that changes a
- * workflow in this repair loop is Claude Code, through its own curl calls, and
- * only when DRY_RUN is off. This module stays read-plus-retry so that rule is
- * visible in one file rather than argued about across several.
+ * **The bridge never edits a workflow's content.** That is Claude Code's job,
+ * through the two helper scripts, and only when DRY_RUN is off. The one thing
+ * this module writes is `active` — and only ever back to what it was before a
+ * repair started (22 Sep 2026, after three North Star workflows came out of an
+ * interrupted repair switched off). Restoring is not editing: it is undoing a
+ * change nobody asked for.
  */
 import { env, n8nApiBase, n8nTimeoutMs } from './config.js';
 
@@ -86,6 +89,18 @@ export async function retryExecution(id) {
     return { started: true, executionId: String(answer), answer };
   }
   return { started: Boolean(answer), executionId: null, answer };
+}
+
+/**
+ * Switches a workflow back on, or off.
+ *
+ * n8n's public API has dedicated endpoints for this — a PUT of the workflow
+ * body ignores `active` entirely — so this is the only way to put the state
+ * back, and it touches nothing else about the workflow.
+ */
+export async function setActive(id, active) {
+  const path = `/workflows/${encodeURIComponent(id)}/${active ? 'activate' : 'deactivate'}`;
+  return call(path, { method: 'POST' });
 }
 
 /** A workflow's executions, newest first. Only used to find a retry that did not name itself. */

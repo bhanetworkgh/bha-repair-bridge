@@ -22,7 +22,7 @@ import express from 'express';
 import { deepHealthTimeoutMs, dryRun, env, envMissing, port } from './config.js';
 import { reachable } from './claude.js';
 import { errText, log, logError } from './log.js';
-import { accept, activeRepairs, busy, RequestError } from './repair.js';
+import { accept, activeRepairs, busy, queued, recover, RequestError, running } from './repair.js';
 
 export function createApp() {
   const app = express();
@@ -44,7 +44,10 @@ export function createApp() {
   app.get('/health', async (req, res) => {
     const base = {
       ok: true,
+      /** Running plus waiting. One runs at a time; the rest are queued. */
       busy: busy(),
+      running: running(),
+      queued: queued(),
       dry_run: dryRun(),
       env_missing: envMissing(),
     };
@@ -92,7 +95,13 @@ export function createApp() {
 
     try {
       const accepted = accept(req.body ?? {});
-      return res.status(202).json({ accepted: true, repair_id: accepted.repair_id });
+      /**
+       * `queue_position` is 0 for a repair that starts now and higher for one
+       * waiting its turn (22 Sep 2026, with the global queue). The two fields
+       * the contract names are unchanged; this one is added so the caller can
+       * see that a repair is queued rather than lost.
+       */
+      return res.status(202).json({ accepted: true, repair_id: accepted.repair_id, ...(accepted.skipped ? {} : { queue_position: accepted.queue_position }) });
     } catch (e) {
       if (e instanceof RequestError) {
         logError(null, 'fix-workflow.rejected', e.message);
@@ -103,8 +112,8 @@ export function createApp() {
     }
   });
 
-  /** What is running right now, by repair id. Useful when a repair seems stuck. */
-  app.get('/repairs/active', (_req, res) => res.json({ busy: busy(), repairs: activeRepairs() }));
+  /** What is running and what is waiting, in order. Useful when a repair seems stuck. */
+  app.get('/repairs/active', (_req, res) => res.json({ busy: busy(), ...activeRepairs() }));
 
   app.use((req, res) => res.status(404).json({ ok: false, error: `No route ${req.method} ${req.path}. This service has /health and /fix-workflow.` }));
 
@@ -131,6 +140,15 @@ if (startedDirectly) {
   const app = createApp();
   const server = app.listen(port(), () => {
     log(null, 'listening', { port: port(), dry_run: dryRun(), env_missing: envMissing() });
+
+    /**
+     * Anything the last process was in the middle of (22 Sep 2026).
+     *
+     * After listening rather than before it, so a slow n8n cannot keep the
+     * service from answering /health — and the reports it sends are the same
+     * two every other repair sends.
+     */
+    void recover().catch((e) => logError(null, 'recover.error', errText(e)));
   });
 
   /**

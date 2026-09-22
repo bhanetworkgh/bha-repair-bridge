@@ -146,6 +146,7 @@ async function runOnce({ answer, changes = true, retryStatus = 'success', dry = 
   process.env.CLAUDE_BIN = await fakeClaude(answer, shellBody);
   process.env.DRY_RUN = dry ? 'true' : 'false';
   process.env.RETRY_WAIT_MS = '5000';
+  process.env.STATE_DIR = await mkdtemp(path.join(tmpdir(), 'repair-state-'));
   process.env.REPAIR_TIMEOUT_MS = '20000';
 
   const { createApp } = await import('../src/server.js');
@@ -195,7 +196,9 @@ test('a repair that moved the version and passed its retry is reported as repair
   const r = await runOnce({ answer: `Here is what I did.\n${REPAIRED}` });
 
   assert.equal(r.status, 202);
-  assert.deepEqual(r.accepted, { accepted: true, repair_id: 'REP-wf1-99' });
+  assert.equal(r.accepted.accepted, true);
+  assert.equal(r.accepted.repair_id, 'REP-wf1-99');
+  assert.equal(r.accepted.queue_position, 0, 'nothing else was running, so it starts now');
 
   const body = r.dashboard.body;
   assert.equal(r.dashboard.headers['x-dashboard-key'], 'dash-key');
