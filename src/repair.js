@@ -1,11 +1,24 @@
 /**
- * The repair itself: accept, refuse, diagnose, verify, report.
+ * The repair itself: accept, refuse, queue, diagnose, verify, report.
  *
  * The shape of it, and why each part is where it is:
  *
+ * **One repair runs at a time, across every workflow** (22 Sep 2026, after the
+ * 08:00 incident). Three repairs were accepted within seconds, three Claude
+ * Code runs started together on a starter instance, the service ran out of
+ * memory and was restarted, and three North Star workflows came out of it
+ * switched off with nothing saved. The lock used to be per workflow, which made
+ * three different workflows three permitted concurrent runs. It is global now
+ * and the rest wait their turn — see `queue.js`.
+ *
  * **Refusals are decided synchronously**, before the 202 goes back, because one
- * of them — one repair per workflow at a time — is a reservation, and a
- * reservation made after the response is a race with the next request.
+ * of them is a reservation, and a reservation made after the response is a race
+ * with the next request.
+ *
+ * **A workflow's active state is never a repair's to change.** It is recorded
+ * before the run and put back afterwards if it differs — including after a
+ * restart, from the record on disk. Restoring is not editing: it undoes a
+ * change nobody asked for.
  *
  * **The outcome is decided here, not by the model.** Claude Code says what it
  * believes it did; this module records `repaired` only where n8n's own
@@ -25,55 +38,35 @@ import { runClaude } from './claude.js';
 import { errText, log, logError } from './log.js';
 import * as n8n from './n8n.js';
 import { context, prompt, snapshotOf } from './prompt.js';
+import * as queue from './queue.js';
+import { INFRASTRUCTURE, infrastructureFailure, isRefusedWorkflow } from './refusals.js';
 import { failedWriteNote, lastFailedWrite, readCallLog, wroteSuccessfully, writeHelperScripts } from './scripts.js';
 import { reportBoth } from './report.js';
+import * as state from './state.js';
 
-/**
- * The workflows this bridge will not touch, by name.
- *
- * The three error handlers, the healer that calls this service, the retry
- * workflow and the reporter: repairing any of them means a machine editing the
- * thing that decides when machines edit things. They are refused by name, and
- * the refusal is reported like any other outcome — a skip is a result, not a
- * silence.
- */
-export const REFUSED_WORKFLOWS = [
-  'Bays — Error Handler',
-  'North Star — Error Handler',
-  'Research Twin — Error Handler',
-  'BHA — Self Healer',
-  'Engine — Self-Healing Retry',
-  'BHA — Self Healer Reports',
-];
-
-/** Dashes differ between what n8n stores and what a payload carries, so compare on a flattened name. */
-export function normalizeName(name) {
-  return String(name ?? '')
-    .toLowerCase()
-    .replace(/[‐-―−-]+/g, '-')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-const REFUSED_SET = new Set(REFUSED_WORKFLOWS.map(normalizeName));
-
-export function isRefusedWorkflow(name) {
-  return REFUSED_SET.has(normalizeName(name));
-}
+export { REFUSED_WORKFLOWS, isRefusedWorkflow, normalizeName } from './refusals.js';
+export { infrastructureFailure } from './refusals.js';
 
 export function repairIdFor(request) {
   return `REP-${request?.workflow?.id ?? 'unknown'}-${request?.execution?.id ?? 'unknown'}`;
 }
 
-/** One repair per workflow at a time. The map is the lock and its size is `busy`. */
-const ACTIVE = new Map();
-
+/** Running plus waiting. One of them can be running; the rest are queued. */
 export function busy() {
-  return ACTIVE.size;
+  return queue.busy();
 }
 
+export function running() {
+  return queue.runningCount();
+}
+
+export function queued() {
+  return queue.queuedCount();
+}
+
+/** What is running and what is waiting, in order. */
 export function activeRepairs() {
-  return [...ACTIVE.entries()].map(([workflow_id, repair_id]) => ({ workflow_id, repair_id }));
+  return queue.snapshot();
 }
 
 /**
@@ -174,8 +167,23 @@ export class RequestError extends Error {
 }
 
 /**
- * Takes a repair request, decides in-line whether it is refused, and starts the
- * work. Returns as soon as the id exists — everything after is asynchronous.
+ * Takes a repair request, decides in-line whether it is refused, and puts it in
+ * the queue. Returns as soon as the id exists — everything after is
+ * asynchronous, including the wait for its turn.
+ *
+ * The three synchronous refusals, in order:
+ *
+ * 1. **A refused workflow** — the machinery that decides when repairs happen.
+ * 2. **An infrastructure failure** — a crashed execution or an out-of-memory
+ *    error. There is no workflow bug for a repair to find, and ten minutes of
+ *    Claude Code looking for one is ten minutes inviting an edit to a workflow
+ *    that was working.
+ * 3. **A workflow already running or already waiting** — deduplicated as
+ *    before, because two runs editing one workflow overwrite each other whether
+ *    they are concurrent or merely consecutive.
+ *
+ * Everything else joins one global queue. It is not refused for being second:
+ * it waits, and a wait is not a silence — its report comes when it runs.
  */
 export function accept(request) {
   const workflowId = str(request?.workflow?.id);
@@ -189,43 +197,119 @@ export function accept(request) {
   const startedAt = new Date().toISOString();
   const t0 = Date.now();
 
-  if (isRefusedWorkflow(workflowName)) {
-    log(repairId, 'skipped.refused', { workflow: workflowName });
+  const skip = (step, detail, { rootCause, humanAction }) => {
+    log(repairId, step, detail);
     void finish({
       request,
       repairId,
       startedAt,
       t0,
       outcome: 'skipped',
-      rootCause: `${workflowName} is on the refuse list: the error handlers, the self healer, the retry workflow and the reports workflow are the machinery that decides when workflows get repaired, and this service does not edit that.`,
+      rootCause,
       changeSummary: 'Nothing was read or changed.',
+      humanAction,
+      workflowName,
+    });
+    return { repair_id: repairId, accepted: true, skipped: true };
+  };
+
+  if (isRefusedWorkflow(workflowName)) {
+    return skip('skipped.refused', { workflow: workflowName }, {
+      rootCause: `${workflowName} is on the refuse list: the error handlers, the self healer, the retry workflow and the reports workflow are the machinery that decides when workflows get repaired, and this service does not edit that.`,
       humanAction: `If ${workflowName} is genuinely broken, fix it by hand — that is deliberate.`,
     });
-    return { repair_id: repairId, accepted: true, skipped: true };
   }
 
-  const running = ACTIVE.get(workflowId);
-  if (running) {
-    log(repairId, 'skipped.busy', { already_running: running });
-    void finish({
-      request,
-      repairId,
-      startedAt,
-      t0,
-      outcome: 'skipped',
-      rootCause: `A repair of this workflow is already running (${running}). One repair per workflow at a time: two Claude Code runs editing one workflow would overwrite each other's changes.`,
-      changeSummary: 'Nothing was read or changed.',
-      humanAction: `Wait for ${running} to report, then look at whether this failure is the same one.`,
+  /**
+   * The crash and out-of-memory refusal, from what the request itself says.
+   * The execution is checked again once it has been read — this first pass
+   * exists so the obvious cases never reach n8n or the queue at all.
+   */
+  const infrastructure = infrastructureFailure({ request });
+  if (infrastructure.refused) {
+    return skip('skipped.infrastructure', { matched: infrastructure.matched }, {
+      rootCause: infrastructure.reason,
+      humanAction: 'Look at the instance rather than the workflow: memory, concurrency, and what else was running at the time. If the workflow really does need less memory to run, that is a change for a person to design.',
     });
-    return { repair_id: repairId, accepted: true, skipped: true };
   }
 
-  ACTIVE.set(workflowId, repairId);
-  void run({ request, repairId, workflowId, executionId, workflowName, startedAt, t0 }).finally(() => {
-    ACTIVE.delete(workflowId);
+  const held = queue.heldBy(workflowId);
+  if (held) {
+    return skip('skipped.busy', { already: held }, {
+      rootCause: `A repair of this workflow is already ${held.state} (${held.repair_id}). One repair per workflow: two runs editing one workflow would overwrite each other.`,
+      humanAction: `Wait for ${held.repair_id} to report, then look at whether this failure is the same one.`,
+    });
+  }
+
+  const { position, waiting_for } = queue.enqueue({
+    repairId,
+    workflowId,
+    onStart: () => log(repairId, 'queue.turn', { waited_ms: Date.now() - t0 }),
+    job: () => run({ request, repairId, workflowId, executionId, workflowName, startedAt, t0 }),
   });
 
-  return { repair_id: repairId, accepted: true, skipped: false };
+  if (position > 0) {
+    log(repairId, 'queued', { position, behind: waiting_for, busy: queue.busy() });
+  }
+
+  return { repair_id: repairId, accepted: true, skipped: false, queue_position: position };
+}
+
+/* ------------------------------------------------------- the active state */
+
+/**
+ * Puts a workflow's active state back if the repair changed it.
+ *
+ * A repair has no business switching a workflow on or off, and the prompt says
+ * so — but a prompt is guidance and this is the guard. On 22 Sep three North
+ * Star workflows were left switched off by an interrupted repair, which is the
+ * worst version of this: the failure was not repaired *and* the workflow
+ * stopped running at all.
+ *
+ * Returns what happened rather than throwing. A restore that failed is on the
+ * row, because a workflow still switched off is the most urgent thing a report
+ * can say.
+ */
+export async function restoreActive({ repairId, workflowId, activeBefore, workflow = null }) {
+  if (typeof activeBefore !== 'boolean') return { checked: false, changed: false, restored: false, now: null, error: null };
+
+  try {
+    const current = workflow ?? (await n8n.workflow(workflowId));
+    const activeNow = Boolean(current?.active);
+    if (activeNow === activeBefore) return { checked: true, changed: false, restored: false, now: activeNow, error: null };
+
+    logError(repairId, 'active.changed', { was: activeBefore, now: activeNow });
+    await n8n.setActive(workflowId, activeBefore);
+
+    // Read it back: a restore is a claim about another system's state, and this
+    // service does not make those without asking.
+    const after = await n8n.workflow(workflowId);
+    const ok = Boolean(after?.active) === activeBefore;
+    log(repairId, ok ? 'active.restored' : 'active.restore.failed', { was: activeBefore, is: Boolean(after?.active) });
+    return {
+      checked: true,
+      changed: true,
+      restored: ok,
+      now: Boolean(after?.active),
+      error: ok ? null : `n8n still reports active=${Boolean(after?.active)} after the restore was asked for.`,
+    };
+  } catch (e) {
+    logError(repairId, 'active.restore.error', errText(e));
+    return { checked: true, changed: true, restored: false, now: null, error: errText(e) };
+  }
+}
+
+/**
+ * The sentence the report carries when the state had to be put back.
+ *
+ * Keyed on whether the state had *changed*, never on what it is now: a restore
+ * that worked leaves the workflow exactly as it was before, which is precisely
+ * the case this sentence exists to report.
+ */
+function activeNote(restore, activeBefore) {
+  if (!restore?.checked || !restore.changed) return null;
+  if (restore.restored) return `Active state restored: the workflow had been switched ${activeBefore ? 'off' : 'on'} during this repair and has been set back to ${activeBefore ? 'active' : 'inactive'}.`;
+  return `ACTIVE STATE NOT RESTORED: this workflow was switched ${activeBefore ? 'off' : 'on'} during the repair and the bridge could not set it back${restore.error ? ` (${restore.error})` : ''}. Switch it ${activeBefore ? 'on' : 'off'} in n8n.`;
 }
 
 /* ---------------------------------------------------------------- the work */
@@ -239,6 +323,8 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
   let versionBefore = null;
   let versionAfter = null;
   let retryExecutionId = null;
+  let activeBefore = null;
+  let recorded = false;
   let failedNode = str(request?.error?.failed_node) ?? str(request?.execution?.lastNodeExecuted);
   let nameFromN8n = workflowName;
 
@@ -248,10 +334,54 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
     versionBefore = str(wf?.versionId);
     snapshot = snapshotOf(wf);
     nameFromN8n = str(wf?.name, workflowName);
-    log(repairId, 'n8n.workflow.read', { version_before: versionBefore, nodes: Array.isArray(wf?.nodes) ? wf.nodes.length : 0 });
+    activeBefore = typeof wf?.active === 'boolean' ? wf.active : null;
+    log(repairId, 'n8n.workflow.read', { version_before: versionBefore, active: activeBefore, nodes: Array.isArray(wf?.nodes) ? wf.nodes.length : 0 });
+
+    /**
+     * On disk before anything can go wrong with it. A file still here at boot
+     * is a repair the process did not survive, and boot reports it and puts
+     * the active state back — which is what nobody did on 22 Sep.
+     */
+    await state.markRunning({
+      repair_id: repairId,
+      workflow_id: workflowId,
+      workflow_name: nameFromN8n,
+      execution_id: executionId,
+      active_before: activeBefore,
+      version_before: versionBefore,
+      started_at: startedAt,
+      request,
+    });
+    recorded = true;
 
     const exec = await n8n.execution(executionId, { includeData: true });
     log(repairId, 'n8n.execution.read', { status: exec?.status ?? null });
+
+    /**
+     * The crash and out-of-memory refusal again, now against the execution's
+     * own status — the reliable version of the check `accept` made on the
+     * request. Refused here, Claude Code is never started.
+     */
+    const infrastructure = infrastructureFailure({ request, execution: exec });
+    if (infrastructure.refused) {
+      log(repairId, 'skipped.infrastructure', { matched: infrastructure.matched, status: exec?.status ?? null });
+      await finish({
+        request,
+        repairId,
+        startedAt,
+        t0,
+        outcome: 'skipped',
+        rootCause: infrastructure.reason,
+        changeSummary: `Skipped — ${INFRASTRUCTURE}. The workflow was read and nothing was changed; Claude Code was never started.`,
+        humanAction: 'Look at the instance rather than the workflow: memory, concurrency, and what else was running at the time. If the workflow really does need less memory to run, that is a change for a person to design.',
+        workflowName: nameFromN8n,
+        failedNode,
+        versionBefore,
+        activeBefore,
+        snapshot,
+      });
+      return;
+    }
 
     const ctx = context({ workflow: wf, execution: exec, failedNodeName: failedNode });
     failedNode = ctx.nodeName ?? failedNode;
@@ -355,6 +485,13 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       }
     }
 
+    /**
+     * The active state, put back if the run changed it. Before the report is
+     * built, so what the report says about it is what actually happened.
+     */
+    const restore = await restoreActive({ repairId, workflowId, activeBefore });
+    const activeSentence = activeNote(restore, activeBefore);
+
     const outcome = decideOutcome({ claimed, versionChanged, retryPassed, retryRan, isDryRun });
 
     const rootCause = str(result?.root_cause) ?? (claudeRun.ok ? 'Claude Code finished without a parseable result, so what it found is not recorded. Nothing is assumed about the workflow.' : `Claude Code did not finish: ${claudeRun.error ?? 'no reason given'}`);
@@ -369,11 +506,15 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       if (claimed && claimed !== 'repaired' && outcome === 'repaired') {
         extra.push(`Claude Code reported this as ${claimed.replace(/_/g, ' ')}, but the workflow's version moved and the retried execution passed — the evidence is what this row records.`);
       }
+      if (activeSentence) extra.push(activeSentence);
       return extra.length ? `${said} ${extra.join(' ')}` : said;
     })();
 
     const humanAction = (() => {
       const said = str(result?.human_action);
+      /** A workflow left switched off is the most urgent thing a report can say. */
+      const stillWrong = restore.changed && !restore.restored ? activeSentence : null;
+      if (stillWrong) return said ? `${stillWrong} ${said}` : stillWrong;
       /**
        * A write n8n refused goes on the row whether or not the model mentioned
        * it. This is the case the scripts were built for: the status and the
@@ -406,9 +547,18 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       retryExecutionId,
       snapshot,
       model: claudeRun.model,
+      activeBefore,
+      activeRestored: restore.restored,
+      activeNow: restore.now,
     });
   } catch (e) {
     logError(repairId, 'failed', { error: errText(e) });
+
+    // A run that ended on an error may still have switched the workflow off,
+    // so the state is checked on this path too.
+    const restore = await restoreActive({ repairId, workflowId, activeBefore });
+    const activeSentence = activeNote(restore, activeBefore);
+
     await finish({
       request,
       repairId,
@@ -416,8 +566,11 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       t0,
       outcome: 'error',
       rootCause: `The repair could not be carried out: ${errText(e)}`,
-      changeSummary: 'Nothing was changed, or nothing can be said about what was: the run ended on an error before it could be verified.',
-      humanAction: 'Look at the bridge’s log for this repair id. The failure is in the bridge or in reaching n8n, not in the workflow.',
+      changeSummary: `Nothing was changed, or nothing can be said about what was: the run ended on an error before it could be verified.${activeSentence ? ` ${activeSentence}` : ''}`,
+      humanAction: activeSentence && !restore.restored ? activeSentence : 'Look at the bridge’s log for this repair id. The failure is in the bridge or in reaching n8n, not in the workflow.',
+      activeBefore,
+      activeRestored: restore.restored,
+      activeNow: restore.now,
       workflowName: nameFromN8n,
       failedNode,
       versionBefore,
@@ -427,6 +580,8 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
     });
   } finally {
     if (workspace) await rm(workspace, { recursive: true, force: true }).catch(() => {});
+    // The record exists to mark a repair that never reported. This one has.
+    if (recorded) await state.clear(repairId).catch((e) => logError(repairId, 'state.clear.failed', errText(e)));
   }
 }
 
@@ -504,6 +659,10 @@ async function finish({
   retryExecutionId = null,
   snapshot = null,
   model = null,
+  activeBefore = null,
+  activeRestored = false,
+  activeNow = null,
+  interrupted = false,
 }) {
   const finishedAt = new Date().toISOString();
   const durationMs = Date.now() - t0;
@@ -540,6 +699,18 @@ async function finish({
      */
     workflow_before: snapshot,
     dry_run: dryRun(),
+    /**
+     * The active state, as three plain fields.
+     *
+     * `active_restored` is the one to read: true means this repair switched the
+     * workflow on or off and the bridge put it back. It is a field as well as a
+     * sentence in `change_summary` because the dashboard stores the whole
+     * payload, and a fact worth acting on should not need reading out of prose.
+     */
+    active_before: activeBefore,
+    active_restored: Boolean(activeRestored),
+    active_now: activeNow,
+    ...(interrupted ? { interrupted_by_restart: true } : {}),
     ...(model ? { model } : {}),
   };
 
@@ -558,7 +729,84 @@ async function finish({
     version_after: versionAfter,
     retry_execution_id: retryExecutionId,
     nodes_changed: nodesChanged,
+    active_restored: Boolean(activeRestored),
   });
 
   await reportBoth({ repairId, dashboardBody, webhookBody });
+}
+
+/* ------------------------------------------------------------- the restart */
+
+/**
+ * What boot does about repairs the last process did not finish.
+ *
+ * This is the whole reason the on-disk record exists. On 22 Sep three repairs
+ * died with the process: nothing was reported, and three workflows were left
+ * switched off. From the dashboard's side those repairs never happened.
+ *
+ * So for each record still on disk, in order:
+ *
+ * 1. Put the workflow's active state back if it differs from what was recorded
+ *    before the run. This is the urgent half — a workflow switched off is not
+ *    failing, it is not running at all.
+ * 2. Report it to both places as `error`, because that is what it was: the
+ *    bridge failed, and nothing is claimed about the workflow. `root_cause`
+ *    says it was interrupted by a restart, and `interrupted_by_restart` is on
+ *    the payload for anything that wants to count them.
+ * 3. Clear the record, so a second restart does not report it twice.
+ *
+ * A record that cannot be read is still reported. We know a repair was running;
+ * not knowing which workflow is a reason to tell somebody, not to stay quiet.
+ */
+export async function recover() {
+  const records = await state.inFlight();
+  if (records.length === 0) return { recovered: 0, repairs: [] };
+
+  logError(null, 'recover.start', { in_flight: records.length, repairs: records.map((r) => r.repair_id) });
+
+  const done = [];
+  for (const record of records) {
+    const repairId = record.repair_id;
+    try {
+      const restore = record.unreadable
+        ? { checked: false, restored: false, now: null, error: 'the in-flight record could not be read' }
+        : await restoreActive({ repairId, workflowId: record.workflow_id, activeBefore: record.active_before });
+      const activeSentence = activeNote(restore, record.active_before);
+
+      const startedAt = record.started_at ?? record.written_at ?? new Date().toISOString();
+      const ran = Date.parse(startedAt);
+
+      await finish({
+        request: record.request ?? { workflow: { id: record.workflow_id, name: record.workflow_name }, execution: { id: record.execution_id } },
+        repairId,
+        startedAt,
+        t0: Number.isFinite(ran) ? ran : Date.now(),
+        outcome: 'error',
+        rootCause: record.unreadable
+          ? 'Interrupted by a restart. The bridge restarted while this repair was running, and its own record of it could not be read, so nothing is known about how far it got.'
+          : `Interrupted by a restart. The bridge restarted while this repair was running — it was killed part-way through, so nothing is known about whether the workflow was changed.`,
+        changeSummary: `Interrupted by a restart: this repair never reported because the process it was running in stopped.${activeSentence ? ` ${activeSentence}` : ''}`,
+        humanAction: activeSentence && !restore.restored
+          ? activeSentence
+          : `Check ${record.workflow_name ?? record.workflow_id ?? 'this workflow'} in n8n: compare its current version with ${record.version_before ?? 'the one it was on before'} and decide whether a half-finished edit is sitting in it. The original failure has not been repaired.`,
+        workflowName: record.workflow_name,
+        versionBefore: record.version_before ?? null,
+        activeBefore: record.active_before ?? null,
+        activeRestored: restore.restored,
+        activeNow: restore.now,
+        interrupted: true,
+      });
+
+      done.push({ repair_id: repairId, active_restored: restore.restored });
+    } catch (e) {
+      logError(repairId, 'recover.failed', errText(e));
+    } finally {
+      // Cleared whatever happened: a record reported twice is its own problem,
+      // and the log above carries anything that went wrong here.
+      await state.clear(repairId).catch(() => {});
+    }
+  }
+
+  logError(null, 'recover.done', { reported: done.length, repairs: done });
+  return { recovered: done.length, repairs: done };
 }

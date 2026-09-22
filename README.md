@@ -25,6 +25,44 @@ request ends in a reported outcome. Silence is the one forbidden result.
 
 ---
 
+## After the 22 September incident
+
+At 08:00 three North Star failures arrived within seconds of each other. The
+lock was per workflow, so three different workflows meant three permitted
+concurrent Claude Code runs; the starter instance ran out of memory and was
+restarted at 08:02:49. The three repairs died with the process — nothing was
+reported — and the three workflows were left **switched off** with no edit
+saved. Four things changed:
+
+1. **One Claude Code run at a time, across every workflow.** The per-workflow
+   lock became one global FIFO queue (`src/queue.js`). A repair is never refused
+   for being second: it waits, and `queue_position` on the 202 says where. A
+   workflow already running *or already waiting* is still skipped — two runs
+   editing one workflow overwrite each other whether they are concurrent or
+   merely consecutive.
+2. **A workflow's active state is never a repair's to change.** It is read
+   before the run and checked after: if it differs, the bridge sets it back
+   through n8n's own `activate`/`deactivate` endpoints, reads it back to confirm,
+   and the report says **"Active state restored"** — as a sentence in
+   `change_summary` and as `active_restored: true` on the payload. A restore that
+   *fails* goes to the top of `human_action`, because a workflow switched off is
+   not failing, it is not running at all.
+3. **Crashes and out-of-memory failures are refused.** An execution whose status
+   is `crashed`, or an error naming `possible out-of-memory` or
+   `WorkflowCrashedError`, is `skipped` as **infrastructure, not a workflow
+   fault** — before Claude Code starts, and (when the request itself says so)
+   before n8n is even read. There is no workflow bug there for a repair to find,
+   and ten minutes looking for one is ten minutes inviting an edit to a workflow
+   that was working.
+4. **A restart cannot swallow a repair.** Every repair writes a small record to
+   disk before it starts and deletes it once it has reported. A record still
+   there at boot is a repair the process did not survive: the bridge puts that
+   workflow's active state back, reports it to **both** places as `error` with
+   `root_cause` "Interrupted by a restart" and `interrupted_by_restart: true`,
+   and clears the record so a second restart does not report it twice. A record
+   too corrupt to read is still reported — knowing a repair was running is
+   reason enough to tell somebody.
+
 ## The four rules that decide an outcome
 
 1. **`repaired` is evidence, not a claim.** It is recorded only where n8n's own
@@ -46,10 +84,10 @@ request ends in a reported outcome. Silence is the one forbidden result.
 
 | | |
 |---|---|
-| `GET /health` | `{ ok, busy, dry_run, env_missing }`. Answers before a single secret is set — that is how anybody finds out which ones are still missing |
+| `GET /health` | `{ ok, busy, running, queued, dry_run, env_missing }`. `running` is 0 or 1 — one repair at a time. Answers before a single secret is set, which is how anybody finds out which ones are still missing |
 | `GET /health?deep=1` | Runs `claude -p "reply with the single word OK"` with no tools and a 60s limit, and returns `{ ok, claude_reachable, model, model_pinned, model_fallback, error }`. **This is the proof that Claude Code reaches OpenRouter on this key**, and it is the thing to run before trusting a repair. `model` is what actually served the request — check it against `model_pinned` |
-| `POST /fix-workflow` | One repair request. `x-api-key` must equal `BRIDGE_KEY`, else 401. Answers `202 { accepted: true, repair_id }` and does the work afterwards |
-| `GET /repairs/active` | What is running right now, by repair id. For when a repair seems stuck |
+| `POST /fix-workflow` | One repair request. `x-api-key` must equal `BRIDGE_KEY`, else 401. Answers `202 { accepted: true, repair_id, queue_position }` and does the work afterwards. `queue_position` is 0 when it starts now, higher when it is waiting its turn |
+| `GET /repairs/active` | What is running and what is waiting, in order. For when a repair seems stuck |
 
 `/fix-workflow` answers before it works because a repair takes up to ten
 minutes: n8n's HTTP node would have given up long before, and a result that only
@@ -84,12 +122,15 @@ second.
 
 ## What a repair does
 
-1. **Refuse or reserve.** A refused workflow, or a second request for a workflow
-   already being repaired, is `skipped` — and reported like any other outcome.
-   Both decisions are made before the 202 goes out, because the second one is a
-   lock and a lock taken after the answer is a race.
-2. **Read.** `GET /workflows/{id}` — `version_before` is its `versionId` — and
-   `GET /executions/{id}?includeData=true`.
+1. **Refuse or queue.** A refused workflow, an infrastructure failure, or a
+   second request for a workflow already running or waiting is `skipped` — and
+   reported like any other outcome. All three are decided before the 202 goes
+   out, because the third is a lock and a lock taken after the answer is a race.
+   Everything else joins the queue.
+2. **Read.** `GET /workflows/{id}` — `version_before` is its `versionId`,
+   `active_before` is its `active` — and `GET /executions/{id}?includeData=true`.
+   The in-flight record is written here, and the crash check runs again against
+   the execution's own status.
 3. **Diagnose.** Claude Code runs in a scratch directory holding `workflow.json`,
    `execution.json`, `failed-node.json`, `error.json`, `request.json` and the
    **two helper scripts below**, with a prompt carrying the error, the failed
@@ -101,7 +142,8 @@ second.
    `version_after`, then `POST /executions/{id}/retry {loadWorkflow:true}` and
    wait for the retry's final status. Success → `repaired`. Anything else →
    `not_repaired`, with the reason on the row.
-5. **Report**, twice.
+5. **Put the active state back** if the run changed it, and say so.
+6. **Report**, twice.
 
 ### The model does not write n8n calls
 
@@ -158,8 +200,8 @@ credentials and the n8n credentials, nothing else. `BRIDGE_KEY`,
 | `repaired` | The workflow's version moved and the retried execution passed. Both, or it is not this |
 | `not_repaired` | Something was changed and the failure is still there — or the change could not be proved, and the row says which |
 | `needs_human` | No root cause, no parseable result, or a repair claimed that n8n does not show. `human_action` says what to do |
-| `skipped` | A refused workflow, or one already being repaired |
-| `error` | The bridge itself failed — n8n unreachable, Claude Code would not start. Never a verdict about the workflow |
+| `skipped` | A refused workflow, one already running or waiting, or an infrastructure failure (a crashed execution, an out-of-memory error) |
+| `error` | The bridge itself failed — n8n unreachable, Claude Code would not start, **or a restart killed the repair**. Never a verdict about the workflow |
 
 The dashboard refuses a sixth name with a 422 rather than filing it under one of
 these. The vocabulary is what the two services share.
@@ -179,6 +221,8 @@ these. The vocabulary is what the two services share.
   "started_at", "finished_at",
   "payload": { /* the original request, whole */ },
   "workflow_before": { /* the workflow as it stood before anything changed */ },
+  "active_before", "active_restored", "active_now",
+  "interrupted_by_restart",   // only on a repair a restart killed
   "dry_run": false
 }
 ```
@@ -222,7 +266,7 @@ otherwise. It works whether or not the global install is on `PATH` at runtime.
 |---|---|
 | `BRIDGE_KEY` | What `/fix-workflow` checks `x-api-key` against. Unset, every request is refused with a 503 that says so — this service does not run with authentication off |
 | `N8N_BASE_URL` | The instance, without `/api/v1` |
-| `N8N_API_KEY` | An n8n instance API key, sent as `X-N8N-API-KEY`. **Needs workflow read and write**: a repair edits a workflow |
+| `N8N_API_KEY` | An n8n instance API key, sent as `X-N8N-API-KEY`. **Needs workflow read, write and activate**: a repair edits a workflow, and the bridge puts the active state back through `activate`/`deactivate` |
 | `DASHBOARD_URL` | The engine dashboard. `/api/engine/repair` is appended |
 | `DASHBOARD_INBOUND_KEY` | The dashboard's inbound key, sent as `x-dashboard-key` |
 | `REPORT_WEBHOOK_URL` | The n8n webhook that posts to Slack and closes the incident |
@@ -237,6 +281,7 @@ otherwise. It works whether or not the global install is on `PATH` at runtime.
 | `CLAUDE_ALLOWED_TOOLS` | Optional, default `Bash,Read,Write,Edit,Glob,Grep` |
 | `CLAUDE_BIN` | Optional. Overrides where the CLI is found |
 | `REPAIR_TIMEOUT_MS`, `RETRY_WAIT_MS`, `DEEP_HEALTH_TIMEOUT_MS`, `N8N_TIMEOUT_MS` | Optional. The defaults are 10 min, 5 min, 60 s, 30 s |
+| `STATE_DIR` | Where in-flight repair records are written. Defaults to the instance's tmp, which survives a process restart — the failure they exist for. A redeploy starts a fresh container and takes them with it, which is fine: a deploy is not a crash |
 
 Everything except `SLACK_REPORT_CHANNEL`, `ANTHROPIC_API_KEY` and the optional
 ones is reported by name in `/health`'s `env_missing` while it is unset.
@@ -266,7 +311,10 @@ the body it could not deliver.
 | | |
 |---|---|
 | `src/server.js` | The three routes, and a shutdown that lets a running repair finish |
-| `src/repair.js` | Accept, refuse, verify, decide — the outcome rules live here |
+| `src/repair.js` | Accept, refuse, verify, decide, restore the active state, recover from a restart |
+| `src/queue.js` | One repair at a time, FIFO, across every workflow |
+| `src/refusals.js` | The six workflows, and what counts as an infrastructure failure |
+| `src/state.js` | The on-disk record that makes a killed repair visible at the next boot |
 | `src/n8n.js` | The n8n API: read a workflow, read an execution, retry one, wait for it |
 | `src/claude.js` | Running the CLI headless, and reading its envelope |
 | `src/prompt.js` | What Claude Code is told and what it is given to read |

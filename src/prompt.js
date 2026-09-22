@@ -181,7 +181,10 @@ RULES YOU MAY NOT BREAK
     names and the rest of the engine reads them; a rename breaks the workflow silently.
   - Never touch credentials. Not the credential a node uses, not its id, not its name.
     If the cause is a credential, that is a person's job: say so in human_action.
-  - Never activate or deactivate a workflow.
+  - Never activate, deactivate or archive a workflow. Whether a workflow is
+    running is not part of any repair, and the bridge checks the active state
+    before and after this run: if it changed, it is put back and the report says
+    so. There is no case where switching it off is the fix.
   - Never change a workflow other than ${wf.id ?? 'the one named above'} — the scripts
     reach only that one, and there is no way around them worth looking for.
   - Do not fix a symptom you cannot explain. If you cannot find the root cause, say so
