@@ -95,3 +95,16 @@ export function n8nTimeoutMs() {
 export function claudeModel() {
   return env('CLAUDE_MODEL');
 }
+
+/**
+ * How often a fix waiting for a later real run is checked, and for how long
+ * (26 Sep 2026). Every ten minutes for up to a day, per the brief: agent tasks
+ * run a few times a day, so a day is enough for the next real call to arrive.
+ */
+export function verifyPollMs() {
+  return Number(process.env.VERIFY_POLL_MS) || 10 * 60 * 1000;
+}
+
+export function verifyWindowMs() {
+  return Number(process.env.VERIFY_WINDOW_MS) || 24 * 60 * 60 * 1000;
+}

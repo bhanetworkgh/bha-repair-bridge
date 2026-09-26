@@ -109,6 +109,33 @@ export async function executionsFor(workflowId, limit = 10) {
   return Array.isArray(r?.data) ? r.data : [];
 }
 
+/**
+ * A workflow's executions that started after `sinceMs`, oldest first.
+ *
+ * n8n lists newest first and its public API has no "started after" filter, so
+ * this pages back with the cursor until it passes `sinceMs` (26 Sep 2026: how an
+ * agent-called workflow's fix is proved — see `verify.js`).
+ */
+export async function executionsSince(workflowId, sinceMs, { maxPages = 5, pageSize = 100 } = {}) {
+  const out = [];
+  let cursor = null;
+  for (let page = 0; page < maxPages; page++) {
+    const q = new URLSearchParams({ workflowId: String(workflowId), limit: String(pageSize), includeData: 'false' });
+    if (cursor) q.set('cursor', cursor);
+    const r = await call(`/executions?${q.toString()}`);
+    const data = Array.isArray(r?.data) ? r.data : [];
+    let passed = false;
+    for (const e of data) {
+      const t = Date.parse(e?.startedAt ?? '');
+      if (Number.isFinite(t) && t <= sinceMs) passed = true;
+      else if (Number.isFinite(t)) out.push(e);
+    }
+    cursor = r?.nextCursor ?? null;
+    if (passed || !cursor) break;
+  }
+  return out.sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
+}
+
 /** The statuses that mean an execution is over. Anything else is still running. */
 const FINAL = new Set(['success', 'error', 'crashed', 'canceled', 'cancelled', 'failed', 'warning']);
 

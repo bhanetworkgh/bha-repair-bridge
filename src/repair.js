@@ -26,6 +26,13 @@
  * a parseable result is `needs_human`. That guard exists twice, here and in the
  * dashboard, because a guard that lives only in the caller is not a guard.
  *
+ * **An agent-called workflow is not proved by retrying its failed input**
+ * (26 Sep 2026). A retry replays whatever the caller sent that one time; for
+ * `Bays — Post Loop Digest` that was an empty call, so the retry of a correct
+ * fix failed and the row said `not_repaired` while four real runs passed. For
+ * those the proof is a later real run, watched for in the background without
+ * holding the queue — see `verify.js` and `watchForProof` below.
+ *
  * **Every path ends in a report.** The try/catch around the whole job is not
  * defensive habit: an exception that escaped would be a repair that happened in
  * silence, which is the one outcome this service may not have.
@@ -33,7 +40,7 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { dryRun, env, repairTimeoutMs, retryWaitMs } from './config.js';
+import { dryRun, env, repairTimeoutMs, retryWaitMs, verifyPollMs, verifyWindowMs } from './config.js';
 import { runClaude } from './claude.js';
 import { errText, log, logError } from './log.js';
 import * as n8n from './n8n.js';
@@ -43,6 +50,7 @@ import { INFRASTRUCTURE, infrastructureFailure, isRefusedWorkflow } from './refu
 import { failedWriteNote, lastFailedWrite, readCallLog, wroteSuccessfully, writeHelperScripts } from './scripts.js';
 import { reportBoth } from './report.js';
 import * as state from './state.js';
+import { agentRecovery, callerOf, failureSignature, laterRuns, named } from './verify.js';
 
 export { REFUSED_WORKFLOWS, isRefusedWorkflow, normalizeName } from './refusals.js';
 export { infrastructureFailure } from './refusals.js';
@@ -66,7 +74,7 @@ export function queued() {
 
 /** What is running and what is waiting, in order. */
 export function activeRepairs() {
-  return queue.snapshot();
+  return { ...queue.snapshot(), verifying: pendingVerifications() };
 }
 
 /**
@@ -139,10 +147,16 @@ function str(v, fallback = null) {
 /**
  * The outcome, from evidence rather than from the model's own account.
  *
- * `repaired` needs both halves: a version that moved, and a retry that passed.
- * Either one alone is a story about a repair, not a repair.
+ * `repaired` needs both halves: a version that moved, and proof that the
+ * failure is gone. Either one alone is a story about a repair, not a repair.
+ *
+ * The proof is a passing retry for a workflow started by its own trigger, and
+ * a later real run for one an agent or another workflow called (26 Sep 2026):
+ * `laterPassed` is a real success after the fix was published, `laterFailed` a
+ * real run that failed the same way, and `pending` means neither has happened
+ * yet — reported as `repaired_pending` and settled by a second report.
  */
-export function decideOutcome({ claimed, versionChanged, retryPassed, retryRan, isDryRun }) {
+export function decideOutcome({ claimed, versionChanged, retryPassed, retryRan, isDryRun, laterPassed = false, laterFailed = false, pending = false }) {
   if (isDryRun) return 'not_repaired';
   if (!claimed) return 'needs_human';
   if (claimed === 'error') return 'error';
@@ -152,6 +166,9 @@ export function decideOutcome({ claimed, versionChanged, retryPassed, retryRan, 
     return claimed === 'repaired' ? 'needs_human' : claimed;
   }
   if (claimed === 'needs_human') return 'needs_human';
+  if (laterFailed) return 'not_repaired';
+  if (laterPassed) return 'repaired';
+  if (pending) return 'repaired_pending';
   if (retryRan && retryPassed) return 'repaired';
   return 'not_repaired';
 }
@@ -386,6 +403,27 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
     const ctx = context({ workflow: wf, execution: exec, failedNodeName: failedNode });
     failedNode = ctx.nodeName ?? failedNode;
 
+    /**
+     * Who called this execution, and whether the caller got past it (26 Sep
+     * 2026). An agent's tool call that failed once and succeeded moments later
+     * in the same agent run is worth saying in the report — and the model is
+     * told, so it looks for a real defect rather than for why an empty call
+     * was empty. The diagnosis and the repair still run: 18124 had a real cause.
+     */
+    const caller = callerOf(exec);
+    const signature = failureSignature(exec, failedNode);
+    const findRecovery = async () => {
+      if (!caller.agentRunId) return null;
+      try {
+        return await agentRecovery({ workflowId, failed: exec });
+      } catch (e) {
+        log(repairId, 'agent.recovery.unread', errText(e));
+        return null;
+      }
+    };
+    let recovered = await findRecovery();
+    log(repairId, 'caller', { mode: caller.mode, called: caller.called, agent_run_id: caller.agentRunId, parent_execution_id: caller.parentExecutionId, recovered: recovered?.execution_id ?? null });
+
     /* 4. Claude Code, on a working directory holding the whole of what it was shown. */
     workspace = await mkdtemp(path.join(tmpdir(), 'repair-'));
 
@@ -415,6 +453,8 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       ctx,
       files,
       dryRun: isDryRun,
+      caller,
+      recovered,
     });
 
     log(repairId, 'claude.start', { timeout_ms: repairTimeoutMs(), prompt_chars: text.length, cwd: workspace });
@@ -460,6 +500,10 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
     let retryRan = false;
     let retryPassed = false;
     let retryNote = null;
+    /** For a called workflow: the later real runs that decide it (26 Sep 2026). */
+    let verification = null;
+    let later = null;
+    let publishedAt = null;
 
     // A write n8n accepted is reason enough to re-read, whatever the model
     // claimed — including a run that ended without a parseable result.
@@ -476,7 +520,19 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       if (!versionChanged) {
         versionAfter = null;
         retryNote = 'The workflow’s version did not move, so nothing was actually changed in n8n and there was nothing to retry.';
+      } else if (caller.called) {
+        /**
+         * Called by an agent or another workflow: retrying would replay the
+         * caller's input, so the proof is a real run after the new version was
+         * published. One may already exist; if not, the report goes out as
+         * `repaired_pending` and `watchForProof` settles it later.
+         */
+        verification = 'later_runs';
+        publishedAt = publishTime(calls);
+        later = await laterRunsOrNothing({ repairId, workflowId, sinceMs: Date.parse(publishedAt), signature, executionId });
+        log(repairId, 'verify.later_runs', { published_at: publishedAt, passed: later.passed.map((r) => r.execution_id), failed_same: later.failedSame?.execution_id ?? null });
       } else {
+        verification = 'retry';
         const retry = await retryAndWait({ repairId, executionId, workflowId });
         retryRan = retry.ran;
         retryPassed = retry.passed;
@@ -485,6 +541,10 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       }
     }
 
+    // The caller may have recovered while the model worked: 18129 started nine
+    // seconds after 18124, before the healer's request had even been answered.
+    if (!recovered) recovered = await findRecovery();
+
     /**
      * The active state, put back if the run changed it. Before the report is
      * built, so what the report says about it is what actually happened.
@@ -492,7 +552,17 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
     const restore = await restoreActive({ repairId, workflowId, activeBefore });
     const activeSentence = activeNote(restore, activeBefore);
 
-    const outcome = decideOutcome({ claimed, versionChanged, retryPassed, retryRan, isDryRun });
+    const outcome = decideOutcome({
+      claimed,
+      versionChanged,
+      retryPassed,
+      retryRan,
+      isDryRun,
+      laterPassed: Boolean(later?.passed.length),
+      laterFailed: Boolean(later?.failedSame),
+      pending: verification === 'later_runs' && !later?.passed.length && !later?.failedSame,
+    });
+    const verifyUntil = outcome === 'repaired_pending' ? new Date(Date.now() + verifyWindowMs()).toISOString() : null;
 
     const rootCause = str(result?.root_cause) ?? (claudeRun.ok ? 'Claude Code finished without a parseable result, so what it found is not recorded. Nothing is assumed about the workflow.' : `Claude Code did not finish: ${claudeRun.error ?? 'no reason given'}`);
 
@@ -502,16 +572,29 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       const extra = [];
       if (refusedWrite) extra.push(failedWriteNote(refusedWrite));
       if (retryNote) extra.push(retryNote);
+      const proof = proofNote({ outcome, verification, later, publishedAt, verifyUntil, executionId, caller });
+      if (proof) extra.push(proof);
+      if (recovered) extra.push(recoveredNote(recovered));
       if (claimed === 'repaired' && !versionChanged) extra.push('Claude Code reported a repair, but n8n shows the same versionId as before it ran — so this is recorded as needing a person rather than as a repair.');
       if (claimed && claimed !== 'repaired' && outcome === 'repaired') {
-        extra.push(`Claude Code reported this as ${claimed.replace(/_/g, ' ')}, but the workflow's version moved and the retried execution passed — the evidence is what this row records.`);
+        extra.push(`Claude Code reported this as ${claimed.replace(/_/g, ' ')}, but the workflow's version moved and ${verification === 'later_runs' ? 'a later real run passed' : 'the retried execution passed'} — the evidence is what this row records.`);
       }
       if (activeSentence) extra.push(activeSentence);
       return extra.length ? `${said} ${extra.join(' ')}` : said;
     })();
 
+    /**
+     * A person is asked only for what the evidence cannot settle (26 Sep 2026).
+     * Once the fix is proved, or is being proved by the runs after it, the
+     * model's own request — 18124's was "confirm the agent populates these
+     * fields", which the next four runs showed — is kept on the payload as
+     * `model_suggestion` rather than put to a person.
+     */
+    const settledByEvidence = outcome === 'repaired' || outcome === 'repaired_pending';
+    const modelSuggestion = settledByEvidence ? str(result?.human_action) : null;
+
     const humanAction = (() => {
-      const said = str(result?.human_action);
+      const said = settledByEvidence ? null : str(result?.human_action);
       /** A workflow left switched off is the most urgent thing a report can say. */
       const stillWrong = restore.changed && !restore.restored ? activeSentence : null;
       if (stillWrong) return said ? `${stillWrong} ${said}` : stillWrong;
@@ -526,15 +609,20 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       if (said) return said;
       if (refusal) return `${refusal} Look at the workflow in n8n and decide whether the fix above is worth applying by hand.`;
       if (outcome === 'needs_human' && !result) return 'Read this repair’s log on the bridge, then look at the workflow yourself: the run finished without saying what it found, so nothing here should be trusted as a diagnosis.';
+      if (outcome === 'not_repaired' && later?.failedSame) return sameFailureAction(later.failedSame, nameFromN8n);
       if (outcome === 'not_repaired') return 'The failure is still there. Look at the root cause above and decide whether it is worth fixing by hand.';
       return null;
     })();
+
+    /** Measured once, so a pending repair's second report carries the same duration as its first. */
+    const repairMs = Date.now() - t0;
 
     await finish({
       request,
       repairId,
       startedAt,
       t0,
+      durationMs: repairMs,
       outcome,
       rootCause,
       changeSummary,
@@ -550,7 +638,52 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       activeBefore,
       activeRestored: restore.restored,
       activeNow: restore.now,
+      verification,
+      verifiedBy: later?.passed ?? [],
+      failedAgain: later?.failedSame ?? null,
+      publishedAt,
+      verifyUntil,
+      agentRecovered: recovered,
+      modelSuggestion,
     });
+
+    /**
+     * Not proved yet, and not held for it: the queue moves on and the watch
+     * runs beside it, on disk so a restart resumes it (26 Sep 2026).
+     */
+    if (outcome === 'repaired_pending') {
+      const watch = {
+        repair_id: repairId,
+        workflow_id: workflowId,
+        execution_id: executionId,
+        since_ms: Date.parse(publishedAt),
+        until: verifyUntil,
+        signature,
+        report: {
+          request,
+          startedAt,
+          durationMs: repairMs,
+          rootCause,
+          saidChange: str(result?.change_summary) ?? 'No change was reported.',
+          nodesChanged: strings(result?.nodes_changed),
+          workflowName: nameFromN8n,
+          failedNode,
+          versionBefore,
+          versionAfter,
+          snapshot,
+          model: claudeRun.model,
+          activeBefore,
+          activeRestored: restore.restored,
+          activeNow: restore.now,
+          publishedAt,
+          agentRecovered: recovered,
+          modelSuggestion,
+          caller,
+        },
+      };
+      await state.markPending(watch).catch((e) => logError(repairId, 'verify.pending.unsaved', errText(e)));
+      watchForProof(watch);
+    }
   } catch (e) {
     logError(repairId, 'failed', { error: errText(e) });
 
@@ -639,6 +772,166 @@ async function retryAndWait({ repairId, executionId, workflowId }) {
   };
 }
 
+/* ------------------------------------------- proof from later real runs */
+
+/**
+ * When the fixed version was published: the last write n8n accepted, from the
+ * scripts' own call log. Its clock is to the second, so the second is rounded
+ * up — a run that started in that same second may have run the old version,
+ * and a proof has to be one that could not have.
+ */
+function publishTime(calls) {
+  const put = [...calls].reverse().find((c) => /^PUT$/i.test(c.method) && c.status >= 200 && c.status < 300);
+  const at = put ? Date.parse(put.at) : NaN;
+  return new Date(Number.isFinite(at) ? at + 999 : Date.now()).toISOString();
+}
+
+/** One look at the runs after the fix. A read that fails is "nothing yet", never a verdict. */
+async function laterRunsOrNothing({ repairId, workflowId, sinceMs, signature, executionId }) {
+  try {
+    return await laterRuns({ workflowId, sinceMs, signature, excludeIds: [executionId] });
+  } catch (e) {
+    logError(repairId, 'verify.later_runs.unread', errText(e));
+    return { passed: [], refused: [], otherFailures: [], failedSame: null, unread: errText(e) };
+  }
+}
+
+const hhmm = (iso) => (iso ? String(iso).replace(/\.\d+Z$/, 'Z') : 'an unknown time');
+
+function calledBy(caller) {
+  if (caller?.agentRunId) return 'called by an agent';
+  if (caller?.parentExecutionId) return `called by another workflow (execution ${caller.parentExecutionId})`;
+  return 'called by an agent or another workflow';
+}
+
+/** The sentence that says how the fix was proved, or why it is not proved yet. */
+function proofNote({ outcome, verification, later, publishedAt, verifyUntil, executionId, caller }) {
+  if (verification !== 'later_runs' || !later) return null;
+  const why = `Execution ${executionId} was not retried: it was ${calledBy(caller)}, so a retry would only replay that call's input.`;
+  if (later.failedSame) {
+    return `${why} A real run after the fix (published ${hhmm(publishedAt)}) failed the same way: execution ${later.failedSame.execution_id} at ${hhmm(later.failedSame.started_at)}.`;
+  }
+  if (later.passed.length) {
+    return `${why} Verified by ${later.passed.length === 1 ? 'a later real run' : `${later.passed.length} later real runs`} after the fix was published at ${hhmm(publishedAt)}: execution ${named(later.passed)}.`;
+  }
+  if (outcome === 'repaired_pending') {
+    return `${why} No real run has started since the fix was published at ${hhmm(publishedAt)}, so it is not proved yet. The bridge checks every ${Math.round(verifyPollMs() / 60000)} minutes until ${hhmm(verifyUntil)} and will send a second report.`;
+  }
+  return why;
+}
+
+function recoveredNote(r) {
+  return `The agent recovered on its own after ${r.after_seconds}s: execution ${r.execution_id}, in the same agent run, succeeded.`;
+}
+
+function sameFailureAction(run, name) {
+  return `Execution ${run.execution_id} at ${hhmm(run.started_at)} failed the same way after the fix, so the fix did not hold. Open that execution of ${name || 'the workflow'} in n8n and compare what it was called with against the root cause above.`;
+}
+
+/** The watches running now, by repair id. For /repairs/active, and so one repair is never watched twice. */
+const watching = new Map();
+
+export function pendingVerifications() {
+  return [...watching.values()].map((w) => ({ repair_id: w.repair_id, workflow_id: w.workflow_id, since: new Date(w.since_ms).toISOString(), until: w.until }));
+}
+
+/**
+ * Settles a `repaired_pending` repair with a second report (26 Sep 2026).
+ *
+ * Every `VERIFY_POLL_MS` (ten minutes) until `until` (a day after the fix):
+ * a real successful run after the publish upgrades it to `repaired`, naming
+ * the executions; a real run that fails the same way downgrades it to
+ * `not_repaired`, naming that one. A day with neither is the one case the
+ * evidence cannot settle, and only then is a person asked — for exactly that.
+ *
+ * Outside the queue on purpose: a day of waiting must not stop the next repair.
+ */
+export function watchForProof(watch, { pollMs = verifyPollMs() } = {}) {
+  if (watching.has(watch.repair_id)) return;
+  const entry = { ...watch, timer: null };
+  watching.set(watch.repair_id, entry);
+  const deadline = Date.parse(watch.until);
+  log(watch.repair_id, 'verify.watching', { since: new Date(watch.since_ms).toISOString(), until: watch.until, every_ms: pollMs });
+
+  const tick = async () => {
+    const later = await laterRunsOrNothing({ repairId: watch.repair_id, workflowId: watch.workflow_id, sinceMs: watch.since_ms, signature: watch.signature, executionId: watch.execution_id });
+    const settled = later.passed.length > 0 || Boolean(later.failedSame);
+    const over = Date.now() >= deadline;
+    log(watch.repair_id, 'verify.check', { passed: later.passed.map((r) => r.execution_id), failed_same: later.failedSame?.execution_id ?? null, over });
+
+    if (!settled && !over) {
+      entry.timer = setTimeout(tick, Math.min(pollMs, Math.max(0, deadline - Date.now())));
+      entry.timer.unref?.();
+      return;
+    }
+    watching.delete(watch.repair_id);
+    try {
+      await settle(watch, later);
+    } catch (e) {
+      logError(watch.repair_id, 'verify.settle.failed', errText(e));
+    } finally {
+      await state.clearPending(watch.repair_id).catch(() => {});
+    }
+  };
+
+  entry.timer = setTimeout(tick, Math.min(pollMs, Math.max(0, deadline - Date.now())));
+  entry.timer.unref?.();
+}
+
+/** The second report: the first one's facts, and what the later runs showed. */
+async function settle(watch, later) {
+  const r = watch.report;
+  const outcome = later.failedSame ? 'not_repaired' : later.passed.length ? 'repaired' : 'needs_human';
+  const proof = proofNote({ outcome, verification: 'later_runs', later, publishedAt: r.publishedAt, verifyUntil: watch.until, executionId: watch.execution_id, caller: r.caller });
+
+  const extra = [proof];
+  if (outcome === 'needs_human') {
+    extra.push(
+      later.unread
+        ? `n8n could not be read at the last check (${later.unread}), so nothing after the fix could be judged.`
+        : `No real run of the workflow started between ${hhmm(r.publishedAt)} and ${hhmm(watch.until)}${later.refused.length ? ` (only ${later.refused.length} that refused its input: ${named(later.refused)})` : ''}${later.otherFailures.length ? `, and ${later.otherFailures.length} that failed some other way: ${named(later.otherFailures)}` : ''}.`,
+    );
+  }
+  if (r.agentRecovered) extra.push(recoveredNote(r.agentRecovered));
+
+  const humanAction =
+    outcome === 'not_repaired'
+      ? sameFailureAction(later.failedSame, r.workflowName)
+      : outcome === 'needs_human'
+        ? `Unverified: whether the fix published at ${hhmm(r.publishedAt)} holds for a real call — nothing has called ${r.workflowName || 'the workflow'} since${later.unread ? ' that n8n would show this bridge' : ''}. The next real call settles it; if one is expected soon, look at that execution when it arrives.`
+        : null;
+
+  await finish({
+    request: r.request,
+    repairId: watch.repair_id,
+    startedAt: r.startedAt,
+    t0: Date.parse(r.startedAt),
+    durationMs: r.durationMs,
+    outcome,
+    rootCause: r.rootCause,
+    changeSummary: `${r.saidChange} ${extra.filter(Boolean).join(' ')}`,
+    nodesChanged: r.nodesChanged,
+    humanAction,
+    workflowName: r.workflowName,
+    failedNode: r.failedNode,
+    versionBefore: r.versionBefore,
+    versionAfter: r.versionAfter,
+    snapshot: r.snapshot,
+    model: r.model,
+    activeBefore: r.activeBefore,
+    activeRestored: r.activeRestored,
+    activeNow: r.activeNow,
+    verification: 'later_runs',
+    verifiedBy: later.passed,
+    failedAgain: later.failedSame,
+    publishedAt: r.publishedAt,
+    verifyUntil: watch.until,
+    agentRecovered: r.agentRecovered,
+    modelSuggestion: r.modelSuggestion,
+    followUp: true,
+  });
+}
+
 /* --------------------------------------------------------------- reporting */
 
 /** Builds both bodies and sends them. Every path through a repair ends here. */
@@ -663,9 +956,19 @@ async function finish({
   activeRestored = false,
   activeNow = null,
   interrupted = false,
+  durationMs: givenDuration = null,
+  verification = null,
+  verifiedBy = [],
+  failedAgain = null,
+  publishedAt = null,
+  verifyUntil = null,
+  agentRecovered = null,
+  modelSuggestion = null,
+  followUp = false,
 }) {
   const finishedAt = new Date().toISOString();
-  const durationMs = Date.now() - t0;
+  /** A follow-up report keeps the repair's own duration: a day of watching is not a slow repair. */
+  const durationMs = givenDuration ?? Date.now() - t0;
 
   const dashboardBody = {
     repair_id: repairId,
@@ -712,6 +1015,24 @@ async function finish({
     active_now: activeNow,
     ...(interrupted ? { interrupted_by_restart: true } : {}),
     ...(model ? { model } : {}),
+    /**
+     * How the fix was proved, and what proved it (26 Sep 2026). `verification`
+     * is "retry" or "later_runs" (null where nothing was changed);
+     * `verified_by` lists the later real runs that passed, `failed_again` the
+     * one that failed the same way, `published_at` when the fixed version went
+     * live, `verify_until` when a `repaired_pending` watch gives up.
+     * `agent_recovered` says the caller got past the failure on its own, and
+     * `model_suggestion` holds a request the model made that the evidence has
+     * since answered. `follow_up` marks the second report of a pending repair.
+     */
+    verification,
+    verified_by: verifiedBy,
+    failed_again: failedAgain,
+    published_at: publishedAt,
+    verify_until: verifyUntil,
+    agent_recovered: agentRecovered,
+    model_suggestion: modelSuggestion,
+    follow_up: followUp,
   };
 
   const webhookBody = {
@@ -759,6 +1080,20 @@ async function finish({
  * not knowing which workflow is a reason to tell somebody, not to stay quiet.
  */
 export async function recover() {
+  /**
+   * Fixes still waiting for a later real run (26 Sep 2026). Their first report
+   * went out as `repaired_pending`; the watch picks up where it was, with the
+   * same deadline, so the second report still comes.
+   */
+  for (const watch of await state.pendingWatches()) {
+    if (watch.unreadable) {
+      logError(watch.repair_id, 'verify.pending.unreadable', 'A pending verification could not be read back after a restart, so it will not be settled automatically. Its row stays repaired_pending; look at the workflow’s runs since the fix.');
+      await state.clearPending(watch.repair_id).catch(() => {});
+      continue;
+    }
+    watchForProof(watch);
+  }
+
   const records = await state.inFlight();
   if (records.length === 0) return { recovered: 0, repairs: [] };
 

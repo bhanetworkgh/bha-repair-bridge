@@ -76,3 +76,46 @@ export async function inFlight() {
   }
   return records;
 }
+
+/* ------------------------------------------------- pending verifications */
+
+/**
+ * A fix waiting for a later real run to prove it (26 Sep 2026).
+ *
+ * An agent-called workflow cannot be proved by retrying its failed input, so
+ * its repair is reported as `repaired_pending` and watched in the background
+ * for up to a day. The watch is written here, beside the in-flight records but
+ * in its own directory, so a restart resumes it rather than leaving a repair
+ * pending for ever. A redeploy takes it with it, like every record here.
+ */
+const pendingDir = () => path.join(stateDir(), 'pending');
+const pendingFile = (repairId) => path.join(pendingDir(), `${encodeURIComponent(repairId)}.json`);
+
+export async function markPending(record) {
+  await mkdir(pendingDir(), { recursive: true });
+  await writeFile(pendingFile(record.repair_id), JSON.stringify({ ...record, written_at: new Date().toISOString() }, null, 2));
+}
+
+export async function clearPending(repairId) {
+  await rm(pendingFile(repairId), { force: true });
+}
+
+/** Every watch still open. An unreadable one is returned as such, so the caller can say so rather than drop it. */
+export async function pendingWatches() {
+  let names;
+  try {
+    names = await readdir(pendingDir());
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const name of names.filter((n) => n.endsWith('.json'))) {
+    try {
+      const record = JSON.parse(await readFile(path.join(pendingDir(), name), 'utf8'));
+      if (record?.repair_id) out.push(record);
+    } catch {
+      out.push({ repair_id: decodeURIComponent(name.replace(/\.json$/, '')), unreadable: true });
+    }
+  }
+  return out;
+}

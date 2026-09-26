@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import { decideOutcome, extractResult, isRefusedWorkflow, normalizeName, repairIdFor, REFUSED_WORKFLOWS } from '../src/repair.js';
 import { readEnvelope } from '../src/claude.js';
 import { upstreamOf, context, snapshotOf, prompt } from '../src/prompt.js';
+import { callerOf, failureSignature, refusalOf } from '../src/verify.js';
 
 test('the repair id is the workflow and the execution', () => {
   assert.equal(repairIdFor({ workflow: { id: 'abc' }, execution: { id: '42' } }), 'REP-abc-42');
@@ -163,4 +164,38 @@ test('the prompt never carries the n8n key, a URL to call, or a curl to copy', (
   const dry = prompt({ repairId: 'R', request, workflow: {}, ctx, files, dryRun: true });
   assert.match(live, /n8n-put-workflow\.sh <file\.json>/);
   assert.match(dry, /Do NOT run \.\/n8n-put-workflow\.sh/);
+});
+
+/* ------------------------------------------------ 26 Sep: agent-called runs */
+
+test('a later real run decides a called workflow: passed is repaired, failed the same way is not, neither yet is pending', () => {
+  const base = { claimed: 'repaired', versionChanged: true, retryPassed: false, retryRan: false, isDryRun: false };
+  assert.equal(decideOutcome({ ...base, laterPassed: true }), 'repaired');
+  assert.equal(decideOutcome({ ...base, laterFailed: true }), 'not_repaired');
+  assert.equal(decideOutcome({ ...base, pending: true }), 'repaired_pending');
+  assert.equal(decideOutcome({ ...base, claimed: 'not_repaired', laterPassed: true }), 'repaired', 'the evidence wins over the model’s own doubt');
+  assert.equal(decideOutcome({ ...base, claimed: 'needs_human', pending: true }), 'needs_human');
+  assert.equal(decideOutcome({ ...base, versionChanged: false, pending: true }), 'needs_human', 'nothing changed, so nothing is pending');
+  assert.equal(decideOutcome({ ...base, isDryRun: true, pending: true }), 'not_repaired');
+  // A failed retry is exactly what 26 Sep had; for a called workflow it is never the input.
+  assert.equal(decideOutcome({ ...base, retryRan: true, retryPassed: false }), 'not_repaired', 'unchanged for a triggered workflow');
+});
+
+test('an agent tool call, a sub-workflow call and a triggered run are told apart', () => {
+  const agent = callerOf({ mode: 'integrated', data: { parentAgentRun: { runId: 'run_1', agentId: 'a' } } });
+  assert.deepEqual([agent.called, agent.agentRunId], [true, 'run_1']);
+  const sub = callerOf({ mode: 'integrated', data: { parentExecution: { executionId: '77' } } });
+  assert.deepEqual([sub.called, sub.parentExecutionId, sub.agentRunId], [true, '77', null]);
+  assert.equal(callerOf({ mode: 'integrated', data: {} }).called, true, 'integrated alone is enough');
+  assert.equal(callerOf({ mode: 'webhook', data: {} }).called, false);
+  assert.equal(callerOf({ mode: 'trigger' }).called, false);
+});
+
+test('a refusal is not a pass, and the same failure is recognised without its line number', () => {
+  const refused = { data: { resultData: { lastNodeExecuted: 'Return', runData: { Return: [{ data: { main: [[{ json: { ok: false, error: 'missing channel_id' } }]] } }] } } } };
+  assert.equal(refusalOf(refused), 'missing channel_id');
+  const done = { data: { resultData: { lastNodeExecuted: 'Return', runData: { Return: [{ data: { main: [[{ json: { ok: true } }]] } }] } } } };
+  assert.equal(refusalOf(done), null);
+  const a = failureSignature({ data: { resultData: { lastNodeExecuted: 'Render', error: { message: 'Loop digest needs channel_id. [line 19]' } } } });
+  assert.deepEqual(a, { node: 'Render', message: 'Loop digest needs channel_id.' });
 });

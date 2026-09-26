@@ -90,13 +90,51 @@ run four to six times the headroom it needs and makes the memory question
 uninteresting, which is the right state for a service whose whole job is to be
 reliable when something else has already broken.
 
+## After the 26 September Post Loop Digest repair
+
+`Bays — Post Loop Digest` is a tool the Bays agent calls. The agent called it
+once with an empty input (execution 18124, mode `integrated`) and it threw;
+nine seconds later, in the same agent run, it called it again properly and it
+passed (18129). The repair found the real cause and made a good fix — then
+"verified" it by retrying 18124. **A retry replays the same empty input**, so it
+failed again (18135), the row said `not_repaired`, and a person was asked to
+check something four later real runs had already shown.
+
+So, for an execution another agent or workflow called (mode `integrated`, or a
+`parentAgentRun` / `parentExecution` on it):
+
+- **It is never retried.** The proof is a later real run: a successful
+  execution of the workflow that started after the fixed version was
+  published (retries and manual runs do not count, and nor does a run that
+  answered `ok: false` — a refusal did no work).
+- **The queue is not held for it.** If no such run exists yet, the repair is
+  reported at once as **`repaired_pending`**, and a background watch looks
+  every 10 minutes for up to 24 hours. It sends a **second report** with the
+  same `repair_id`: `repaired`, naming the executions that proved it, or
+  `not_repaired` if a later real run failed the same way (same node, same
+  message), naming that run. A day with no real run at all is the one thing
+  the evidence cannot settle, and only then is it `needs_human`, saying
+  exactly that. The watch is written to disk and resumed after a restart.
+- **Before diagnosing, the bridge looks for the agent's own recovery**: a
+  success of the same workflow later in the same agent run (`parentAgentRun.runId`).
+  If there is one, the report says so — "the agent recovered on its own after
+  9s: execution 18129" — and the model is told. The diagnosis and the fix still
+  run: 18124 had a real cause.
+- **`human_action` asks only for what the evidence cannot settle.** On
+  `repaired` and `repaired_pending` the model's own request is kept on the
+  payload as `model_suggestion`, not put to a person.
+
+Workflows started by their own trigger are verified exactly as before, by
+retrying the failed execution: their input is the event that fired them.
+
 ## The four rules that decide an outcome
 
 1. **`repaired` is evidence, not a claim.** It is recorded only where n8n's own
-   `versionId` moved *and* the retried execution passed. Claude Code saying it
-   repaired something is not a repair; the bridge re-reads the workflow and
-   retries the original execution, and anything short of both is
-   `not_repaired` or `needs_human`.
+   `versionId` moved *and* the fix was proved: the retried execution passed,
+   or — for a workflow an agent or another workflow called — a later real run
+   passed. Claude Code saying it repaired something is not a repair, and
+   anything short of both is `repaired_pending`, `not_repaired` or
+   `needs_human`.
 2. **An unparseable run is `needs_human`.** A run that finished without a
    readable result has told us nothing, and nothing is assumed from nothing.
 3. **Both reports always go out**, whatever happened — including a skip, and
@@ -114,7 +152,7 @@ reliable when something else has already broken.
 | `GET /health` | `{ ok, busy, running, queued, dry_run, env_missing }`. `running` is 0 or 1 — one repair at a time. Answers before a single secret is set, which is how anybody finds out which ones are still missing |
 | `GET /health?deep=1` | Runs `claude -p "reply with the single word OK"` with no tools and a 60s limit, and returns `{ ok, claude_reachable, model, model_pinned, model_fallback, error }`. **This is the proof that Claude Code reaches OpenRouter on this key**, and it is the thing to run before trusting a repair. `model` is what actually served the request — check it against `model_pinned` |
 | `POST /fix-workflow` | One repair request. `x-api-key` must equal `BRIDGE_KEY`, else 401. Answers `202 { accepted: true, repair_id, queue_position }` and does the work afterwards. `queue_position` is 0 when it starts now, higher when it is waiting its turn |
-| `GET /repairs/active` | What is running and what is waiting, in order. For when a repair seems stuck |
+| `GET /repairs/active` | What is running and what is waiting, in order, and `verifying`: the `repaired_pending` fixes being watched. For when a repair seems stuck |
 
 `/fix-workflow` answers before it works because a repair takes up to ten
 minutes: n8n's HTTP node would have given up long before, and a result that only
@@ -166,9 +204,12 @@ second.
    node, never touch credentials, never activate or deactivate a workflow. Ten
    minutes, hard.
 4. **Verify.** If it changed something: re-read the workflow for
-   `version_after`, then `POST /executions/{id}/retry {loadWorkflow:true}` and
-   wait for the retry's final status. Success → `repaired`. Anything else →
-   `not_repaired`, with the reason on the row.
+   `version_after`. For a triggered workflow, `POST /executions/{id}/retry
+   {loadWorkflow:true}` and wait for the retry's final status: success →
+   `repaired`, anything else → `not_repaired`, with the reason on the row. For
+   an agent- or workflow-called one, look for a real run after the publish:
+   passed → `repaired`, failed the same way → `not_repaired`, none yet →
+   `repaired_pending` and a background watch (above).
 5. **Put the active state back** if the run changed it, and say so.
 6. **Report**, twice.
 
@@ -220,17 +261,18 @@ The child process gets a **deliberately small environment**: the model
 credentials and the n8n credentials, nothing else. `BRIDGE_KEY`,
 `DASHBOARD_INBOUND_KEY` and the report webhook never reach it.
 
-### The five outcomes
+### The six outcomes
 
 | | |
 |---|---|
-| `repaired` | The workflow's version moved and the retried execution passed. Both, or it is not this |
+| `repaired` | The workflow's version moved and the fix was proved — the retried execution passed, or, for a called workflow, a later real run did. Both, or it is not this |
+| `repaired_pending` | A called workflow's version moved and no real run has happened since. Not a verdict: a second report with the same `repair_id` follows within 24 hours |
 | `not_repaired` | Something was changed and the failure is still there — or the change could not be proved, and the row says which |
 | `needs_human` | No root cause, no parseable result, or a repair claimed that n8n does not show. `human_action` says what to do |
 | `skipped` | A refused workflow, one already running or waiting, or an infrastructure failure (a crashed execution, an out-of-memory error) |
 | `error` | The bridge itself failed — n8n unreachable, Claude Code would not start, **or a restart killed the repair**. Never a verdict about the workflow |
 
-The dashboard refuses a sixth name with a 422 rather than filing it under one of
+The dashboard refuses a name it does not know with a 422 rather than filing it under one of
 these. The vocabulary is what the two services share.
 
 ## The reports
@@ -250,7 +292,16 @@ these. The vocabulary is what the two services share.
   "workflow_before": { /* the workflow as it stood before anything changed */ },
   "active_before", "active_restored", "active_now",
   "interrupted_by_restart",   // only on a repair a restart killed
-  "dry_run": false
+  "dry_run": false,
+  // 26 Sep 2026 — how the fix was proved
+  "verification",      // "retry" | "later_runs" | null (nothing was changed)
+  "verified_by",       // [{ execution_id, started_at }] later real runs that passed
+  "failed_again",      // { execution_id, started_at, status } a later run that failed the same way, or null
+  "published_at",      // when the fixed version went live; runs after it count
+  "verify_until",      // on repaired_pending: when the watch gives up
+  "agent_recovered",   // { execution_id, started_at, after_seconds, agent_run_id } or null
+  "model_suggestion",  // the model's human_action, where the evidence already answers it
+  "follow_up"          // true on the second report of a repaired_pending repair
 }
 ```
 
@@ -308,6 +359,7 @@ otherwise. It works whether or not the global install is on `PATH` at runtime.
 | `CLAUDE_ALLOWED_TOOLS` | Optional, default `Bash,Read,Write,Edit,Glob,Grep` |
 | `CLAUDE_BIN` | Optional. Overrides where the CLI is found |
 | `REPAIR_TIMEOUT_MS`, `RETRY_WAIT_MS`, `DEEP_HEALTH_TIMEOUT_MS`, `N8N_TIMEOUT_MS` | Optional. The defaults are 10 min, 5 min, 60 s, 30 s |
+| `VERIFY_POLL_MS`, `VERIFY_WINDOW_MS` | Optional. How often a `repaired_pending` fix is checked for a later real run, and for how long: 10 min and 24 h |
 | `STATE_DIR` | Where in-flight repair records are written. Defaults to the instance's tmp, which survives a process restart — the failure they exist for. A redeploy starts a fresh container and takes them with it, which is fine: a deploy is not a crash |
 
 Everything except `SLACK_REPORT_CHANNEL`, `ANTHROPIC_API_KEY` and the optional
@@ -342,7 +394,8 @@ the body it could not deliver.
 | `src/queue.js` | One repair at a time, FIFO, across every workflow |
 | `src/refusals.js` | The six workflows, and what counts as an infrastructure failure |
 | `src/state.js` | The on-disk record that makes a killed repair visible at the next boot |
-| `src/n8n.js` | The n8n API: read a workflow, read an execution, retry one, wait for it |
+| `src/n8n.js` | The n8n API: read a workflow, read an execution, retry one, wait for it, list the runs since a time |
+| `src/verify.js` | Who called an execution, whether the agent recovered on its own, and what the real runs after a fix say |
 | `src/claude.js` | Running the CLI headless, and reading its envelope |
 | `src/prompt.js` | What Claude Code is told and what it is given to read |
 | `src/scripts.js` | The two n8n helper scripts, their call log, and what a refused write means |
