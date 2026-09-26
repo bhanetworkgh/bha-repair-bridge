@@ -106,7 +106,7 @@ export function snapshotOf(workflow) {
  * read and write goes through the two scripts in the working directory. That is
  * the whole point of them — see `scripts.js`.
  */
-export function prompt({ repairId, request, workflow, ctx, files, dryRun }) {
+export function prompt({ repairId, request, workflow, ctx, files, dryRun, caller = null, recovered = null }) {
   const error = request?.error ?? {};
   const wf = request?.workflow ?? {};
   const exec = request?.execution ?? {};
@@ -140,6 +140,28 @@ Two scripts in your working directory are the ONLY way to reach it:
   is unchanged. Say so in human_action, quoting the status and the body it
   printed, and report "needs_human" rather than "repaired".`;
 
+  /**
+   * Who sent this input (26 Sep 2026). An agent's tool call carries whatever
+   * the agent chose to send, so an empty or malformed call is the agent's
+   * mistake unless the workflow invited it — as Post Loop Digest's trigger did,
+   * by declaring no inputs at all.
+   */
+  const callerNote = caller?.called
+    ? `\nWHO CALLED IT
+  This execution was not started by its own trigger: it was called by ${caller.agentRunId ? `an agent (agent run ${caller.agentRunId})` : caller.parentExecutionId ? `another workflow (execution ${caller.parentExecutionId})` : 'an agent or another workflow (mode "integrated")'}.
+  Its input is whatever that caller sent, once.${
+    recovered
+      ? `\n  The caller recovered on its own: it called this workflow again ${recovered.after_seconds}s later in the same run, and that call succeeded (execution ${recovered.execution_id}).`
+      : ''
+  }
+  Look for a real defect in THIS workflow that let a bad call through or made a
+  good call fail — an input it never declares, a field read under the wrong name.
+  If the only problem is the input one call happened to carry, change nothing and
+  report "not_repaired" with the root cause.
+  Your fix will not be checked by retrying this execution (that only replays the
+  same input); it is checked against the next real calls after you save.\n`
+    : '';
+
   return `You are repairing one failed n8n workflow for Bays Horizon Advisory. Repair id ${repairId}.
 
 Work on your own to the end: nobody is watching this run and there is nobody to ask.
@@ -151,7 +173,7 @@ THE FAILURE
   Error class:    ${error.class ?? '(unknown)'}
   Severity:       ${error.severity ?? '(unknown)'}${error.subsystem ? `\n  Subsystem:      ${error.subsystem}` : ''}
   Error message:  ${clip(error.message ?? '(none given)', 2000)}
-
+${callerNote}
 THE FAILED NODE, AS IT IS CONFIGURED
 ${clip(ctx.node ?? '(the node named above is not in the workflow — that may itself be the problem)')}
 
@@ -203,7 +225,12 @@ Your last output must be one JSON object and nothing after it:
 }
 
 "repaired" means you changed the workflow and believe the failure is fixed. It is
-checked afterwards: this service re-reads the workflow and retries the failed
-execution, and only a real version change plus a passing retry is recorded as a
-repair. Claiming more than you did gains nothing and costs the record.`;
+checked afterwards: this service re-reads the workflow and then proves the fix —
+by retrying the failed execution, or, for a workflow another caller invoked, by
+the next real runs after your save. Only a real version change plus that proof is
+recorded as a repair. Claiming more than you did gains nothing and costs the record.
+
+human_action is for what the evidence cannot settle. Do not ask a person to
+confirm that the fix works, or that a caller sends the right fields: the runs
+after your save will show that.`;
 }
