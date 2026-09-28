@@ -46,13 +46,13 @@ import { errText, log, logError } from './log.js';
 import * as n8n from './n8n.js';
 import { context, prompt, snapshotOf } from './prompt.js';
 import * as queue from './queue.js';
-import { INFRASTRUCTURE, infrastructureFailure, isRefusedWorkflow } from './refusals.js';
+import { INFRASTRUCTURE, infrastructureFailure, isProtectedWorkflow, isRefusedWorkflow } from './refusals.js';
 import { failedWriteNote, lastFailedWrite, readCallLog, wroteSuccessfully, writeHelperScripts } from './scripts.js';
 import { reportBoth } from './report.js';
 import * as state from './state.js';
 import { agentRecovery, callerOf, failureSignature, laterRuns, named } from './verify.js';
 
-export { REFUSED_WORKFLOWS, isRefusedWorkflow, normalizeName } from './refusals.js';
+export { REFUSED_WORKFLOWS, PROTECTED_WORKFLOWS, isProtectedWorkflow, isRefusedWorkflow, normalizeName } from './refusals.js';
 export { infrastructureFailure } from './refusals.js';
 
 export function repairIdFor(request) {
@@ -329,11 +329,76 @@ function activeNote(restore, activeBefore) {
   return `ACTIVE STATE NOT RESTORED: this workflow was switched ${activeBefore ? 'off' : 'on'} during the repair and the bridge could not set it back${restore.error ? ` (${restore.error})` : ''}. Switch it ${activeBefore ? 'on' : 'off'} in n8n.`;
 }
 
+/* ------------------------------------------------------- the automatic revert */
+
+/**
+ * Puts a workflow back to how it stood before the repair (28 Sep 2026, Destiny —
+ * Agent Upgrade Plan step 4.4).
+ *
+ * Called only when a repair changed the workflow and the change did not fix the
+ * failure — the retry failed, or a later real run failed the same way. A change
+ * that did not help is still a change nobody asked for, and leaving it live
+ * means the next person reads a workflow that is neither what it was nor fixed.
+ *
+ * The same guard the dashboard's Revert button has: **the workflow must still be
+ * at the version this repair left it**. If anyone has edited it since, a blind
+ * restore would throw their work away, so nothing is written and the report
+ * says why. A restore is also a claim about another system's state, so it is
+ * read back: only a version that moved again counts as reverted.
+ */
+export async function revertToSnapshot({ repairId, workflowId, snapshot, expectVersion }) {
+  if (!snapshot || !Array.isArray(snapshot.nodes) || !snapshot.connections) {
+    return { attempted: false, reverted: false, at: null, version: null, reason: 'no snapshot of the workflow before the repair was taken, so there is nothing to restore from' };
+  }
+  try {
+    const current = await n8n.workflow(workflowId);
+    const now = str(current?.versionId);
+    if (expectVersion && now && now !== expectVersion) {
+      log(repairId, 'revert.skipped.edited', { expected: expectVersion, now });
+      return { attempted: false, reverted: false, at: null, version: now, reason: `the workflow has been edited since this repair (it is at ${now}, the repair left ${expectVersion}), and restoring over that would throw the edit away` };
+    }
+    await n8n.putWorkflow(workflowId, snapshot);
+    const after = await n8n.workflow(workflowId);
+    const version = str(after?.versionId);
+    const ok = Boolean(version && version !== expectVersion);
+    log(repairId, ok ? 'revert.done' : 'revert.unconfirmed', { from: expectVersion, to: version, snapshot_of: snapshot.versionId ?? null });
+    return {
+      attempted: true,
+      reverted: ok,
+      at: ok ? new Date().toISOString() : null,
+      version,
+      reason: ok ? null : `n8n accepted the restore but still shows version ${version ?? 'unknown'}, so it cannot be confirmed`,
+    };
+  } catch (e) {
+    logError(repairId, 'revert.failed', errText(e));
+    return { attempted: true, reverted: false, at: null, version: null, reason: errText(e) };
+  }
+}
+
+/** The sentence both reports carry about the revert, or null where none was tried. */
+function revertNote(revert, versionBefore) {
+  if (!revert) return null;
+  if (revert.reverted) return `Reverted automatically: the change did not fix the failure, so the workflow was restored to how it stood before this repair (the ${versionBefore ?? 'earlier'} content, now saved as version ${revert.version}).`;
+  return `NOT REVERTED: the change did not fix the failure and could not be put back automatically — ${revert.reason}.`;
+}
+
+/** What a person is asked when a failed change could not be put back. */
+function revertAction(revert) {
+  if (!revert || revert.reverted) return null;
+  return `The change this repair made is still live and did not fix the failure: ${revert.reason}. Put it back from the Repairs tab on the dashboard, or by hand from the workflow's history in n8n.`;
+}
+
+/** The standing wording for a protected workflow's proposed-only repair. */
+const PROTECTED_PREFIX = 'PROPOSED ONLY (protected agent-facing workflow; nothing was written): ';
+const PROTECTED_ACTION = 'This is one of the six agent-facing workflows (a front door or an agent delivery workflow), which this bridge diagnoses but never edits. Review the proposed fix above, apply it by hand with a named version and a restore point, test it with pinned data, and verify it on the next real run.';
+
 /* ---------------------------------------------------------------- the work */
 
 async function run({ request, repairId, workflowId, executionId, workflowName, startedAt, t0 }) {
-  const isDryRun = dryRun();
-  log(repairId, 'start', { workflow_id: workflowId, workflow_name: workflowName, execution_id: executionId, dry_run: isDryRun });
+  /** A protected workflow runs exactly as a dry run does: diagnose, never write (28 Sep, plan step 4.4). */
+  const protectedWorkflow = isProtectedWorkflow(workflowName, workflowId);
+  const isDryRun = dryRun() || protectedWorkflow;
+  log(repairId, 'start', { workflow_id: workflowId, workflow_name: workflowName, execution_id: executionId, dry_run: isDryRun, protected: protectedWorkflow });
 
   let workspace = null;
   let snapshot = null;
@@ -434,7 +499,7 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
      * log every call to `callLog`, which is read below: a write n8n refused is
      * then a fact this service holds, not a claim the model makes about itself.
      */
-    const helpers = await writeHelperScripts({ dir: workspace, workflowId });
+    const helpers = await writeHelperScripts({ dir: workspace, workflowId, readOnly: isDryRun });
     const callLog = helpers.log;
 
     const files = ['workflow.json', 'execution.json', 'failed-node.json', 'error.json', 'request.json', ...helpers.names];
@@ -552,7 +617,7 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
     const restore = await restoreActive({ repairId, workflowId, activeBefore });
     const activeSentence = activeNote(restore, activeBefore);
 
-    const outcome = decideOutcome({
+    const decided = decideOutcome({
       claimed,
       versionChanged,
       retryPassed,
@@ -562,13 +627,23 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       laterFailed: Boolean(later?.failedSame),
       pending: verification === 'later_runs' && !later?.passed.length && !later?.failedSame,
     });
+    /** A protected workflow's proposal is a person's to apply, which is what needs_human means. */
+    const outcome = protectedWorkflow && !dryRun() ? 'needs_human' : decided;
+
+    /**
+     * A change that did not fix the failure is put back (28 Sep, plan step 4.4),
+     * before the report is built so the report says what actually happened.
+     */
+    const revert = !isDryRun && outcome === 'not_repaired' && versionChanged
+      ? await revertToSnapshot({ repairId, workflowId, snapshot, expectVersion: versionAfter })
+      : null;
     const verifyUntil = outcome === 'repaired_pending' ? new Date(Date.now() + verifyWindowMs()).toISOString() : null;
 
     const rootCause = str(result?.root_cause) ?? (claudeRun.ok ? 'Claude Code finished without a parseable result, so what it found is not recorded. Nothing is assumed about the workflow.' : `Claude Code did not finish: ${claudeRun.error ?? 'no reason given'}`);
 
     const changeSummary = (() => {
       const said = str(result?.change_summary) ?? (claudeRun.ok ? 'No change was reported.' : 'No change was reported: the run did not finish.');
-      if (isDryRun) return `DRY RUN: ${said}`;
+      if (isDryRun) return `${protectedWorkflow && !dryRun() ? PROTECTED_PREFIX : 'DRY RUN: '}${said}`;
       const extra = [];
       if (refusedWrite) extra.push(failedWriteNote(refusedWrite));
       if (retryNote) extra.push(retryNote);
@@ -580,6 +655,8 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
         extra.push(`Claude Code reported this as ${claimed.replace(/_/g, ' ')}, but the workflow's version moved and ${verification === 'later_runs' ? 'a later real run passed' : 'the retried execution passed'} — the evidence is what this row records.`);
       }
       if (activeSentence) extra.push(activeSentence);
+      const reverted = revertNote(revert, versionBefore);
+      if (reverted) extra.push(reverted);
       return extra.length ? `${said} ${extra.join(' ')}` : said;
     })();
 
@@ -598,6 +675,10 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       /** A workflow left switched off is the most urgent thing a report can say. */
       const stillWrong = restore.changed && !restore.restored ? activeSentence : null;
       if (stillWrong) return said ? `${stillWrong} ${said}` : stillWrong;
+      if (protectedWorkflow && !dryRun()) return PROTECTED_ACTION;
+      /** A failed change still live is the next most urgent thing after a workflow left off. */
+      const unreverted = revertAction(revert);
+      if (unreverted) return said ? `${unreverted} ${said}` : unreverted;
       /**
        * A write n8n refused goes on the row whether or not the model mentioned
        * it. This is the case the scripts were built for: the status and the
@@ -645,6 +726,8 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       verifyUntil,
       agentRecovered: recovered,
       modelSuggestion,
+      revert,
+      protectedWorkflow,
     });
 
     /**
@@ -894,9 +977,16 @@ async function settle(watch, later) {
   }
   if (r.agentRecovered) extra.push(recoveredNote(r.agentRecovered));
 
+  /** A later real run failed the same way: the fix did not hold, so it is put back (28 Sep, plan step 4.4). */
+  const revert = outcome === 'not_repaired'
+    ? await revertToSnapshot({ repairId: watch.repair_id, workflowId: watch.workflow_id, snapshot: r.snapshot, expectVersion: r.versionAfter })
+    : null;
+  const reverted = revertNote(revert, r.versionBefore);
+  if (reverted) extra.push(reverted);
+
   const humanAction =
     outcome === 'not_repaired'
-      ? sameFailureAction(later.failedSame, r.workflowName)
+      ? [revertAction(revert), sameFailureAction(later.failedSame, r.workflowName)].filter(Boolean).join(' ')
       : outcome === 'needs_human'
         ? `Unverified: whether the fix published at ${hhmm(r.publishedAt)} holds for a real call — nothing has called ${r.workflowName || 'the workflow'} since${later.unread ? ' that n8n would show this bridge' : ''}. The next real call settles it; if one is expected soon, look at that execution when it arrives.`
         : null;
@@ -929,6 +1019,7 @@ async function settle(watch, later) {
     agentRecovered: r.agentRecovered,
     modelSuggestion: r.modelSuggestion,
     followUp: true,
+    revert,
   });
 }
 
@@ -965,6 +1056,8 @@ async function finish({
   agentRecovered = null,
   modelSuggestion = null,
   followUp = false,
+  revert = null,
+  protectedWorkflow = false,
 }) {
   const finishedAt = new Date().toISOString();
   /** A follow-up report keeps the repair's own duration: a day of watching is not a slow repair. */
@@ -1033,6 +1126,19 @@ async function finish({
     agent_recovered: agentRecovered,
     model_suggestion: modelSuggestion,
     follow_up: followUp,
+    /**
+     * 28 Sep 2026 (plan step 4.4). `protected_workflow`: one of the six
+     * agent-facing workflows, diagnosed but never edited. `auto_reverted`:
+     * this repair's change did not fix the failure and was put back —
+     * `reverted_at` and `reverted_to_version` say when and to what, and the
+     * dashboard stamps its own `reverted_at` from them. `auto_revert_error`
+     * says why a revert that was needed did not happen.
+     */
+    protected_workflow: Boolean(protectedWorkflow),
+    auto_reverted: Boolean(revert?.reverted),
+    reverted_at: revert?.reverted ? revert.at : null,
+    reverted_to_version: revert?.reverted ? revert.version : null,
+    auto_revert_error: revert && !revert.reverted ? revert.reason : null,
   };
 
   const webhookBody = {

@@ -137,12 +137,26 @@ exit 1
 `;
 }
 
+/**
+ * The put script for a read-only run (a dry run, or a protected agent-facing
+ * workflow): it refuses, calls nothing, and says why. The prompt already tells
+ * the model not to write in a dry run, but a guard that lives only in a prompt
+ * is not a guard — a model that ignored it would still have reached n8n
+ * (28 Sep 2026, Agent Upgrade Plan step 4.4).
+ */
+export function refusingPutScriptSource() {
+  return `#!/bin/sh
+echo "Refused: this repair is read only (a dry run, or a protected agent-facing workflow). Nothing was sent to n8n. Describe the change in change_summary instead." >&2
+exit 3
+`;
+}
+
 /** Writes both scripts into a repair's working directory, executable. */
-export async function writeHelperScripts({ dir, workflowId }) {
+export async function writeHelperScripts({ dir, workflowId, readOnly = false }) {
   const get = path.join(dir, GET_SCRIPT);
   const put = path.join(dir, PUT_SCRIPT);
   await writeFile(get, getScriptSource(workflowId));
-  await writeFile(put, putScriptSource(workflowId));
+  await writeFile(put, readOnly ? refusingPutScriptSource() : putScriptSource(workflowId));
   await chmod(get, 0o755);
   await chmod(put, 0o755);
   return { get, put, log: path.join(dir, CALL_LOG), names: [GET_SCRIPT, PUT_SCRIPT] };

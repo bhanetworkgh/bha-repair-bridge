@@ -127,6 +127,38 @@ So, for an execution another agent or workflow called (mode `integrated`, or a
 Workflows started by their own trigger are verified exactly as before, by
 retrying the failed execution: their input is the event that fired them.
 
+## After 28 September: a failed change is put back, and six workflows are read only
+
+Agent Upgrade Plan step 4.4 gates the healer two ways.
+
+**A change whose retry still fails is reverted automatically.** Before, a
+`not_repaired` repair left its edit live: the workflow was changed *and* still
+broken, and the only way back was the Revert button on the dashboard. Now the
+bridge restores the snapshot it read before the model touched anything
+(`PUT /workflows/{id}` with that snapshot's name, nodes, connections and
+settings — never `active`), both straight after a failed retry and when a
+pending repair settles as failed. It re-reads the workflow first and **does not
+restore over an edit made since the repair** — the row then says
+`NOT REVERTED` and why, and the change is left for a person. The reports carry
+`auto_reverted`, `reverted_at`, `reverted_to_version` and `auto_revert_error`;
+the dashboard stamps the row reverted by `bridge (auto)` and never overwrites a
+revert somebody made there.
+
+**The six agent-facing workflows are diagnosed but never written**: the three
+Front Doors (`134ezjaO6gYqYjez`, `6S4X6UYtDpETB6u6`, `K1iQ72ZTEzQKrxb9`) and
+the three Agent Deliveries (`5AFqtZQaeKFFiGqe`, `cnOz6iomtnWVXjso`,
+`w4SdZjjpokMuWPkV`), matched by id first and then by name. The run is forced
+into dry-run shape — nothing written, nothing retried — its change summary
+starts `PROPOSED ONLY`, and the outcome is `needs_human` with the proposed fix
+as the action. A mistake in one of these stops every conversation with an
+agent, so a person applies the change through the engine change checklist.
+
+**In any read-only run the put script refuses in code.** A dry run used to rely
+on the prompt alone to stop the model writing; the helper it was handed would
+still have reached n8n. Now `n8n-put-workflow.sh` is written as a script that
+exits 3 and calls nothing whenever the run is a dry run or a protected
+workflow. `test/revert.test.js` pins all of this.
+
 ## The four rules that decide an outcome
 
 1. **`repaired` is evidence, not a claim.** It is recorded only where n8n's own

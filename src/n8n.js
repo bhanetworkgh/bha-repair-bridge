@@ -103,6 +103,20 @@ export async function setActive(id, active) {
   return call(path, { method: 'POST' });
 }
 
+/**
+ * Writes a workflow back from a snapshot (28 Sep 2026 — the automatic revert).
+ *
+ * Sends only `name`, `nodes`, `connections` and `settings`, the same four keys
+ * the repair's own write script sends: n8n refuses its read-only fields, and
+ * `active` is never sent, because a restore that switched a live workflow on or
+ * off would be a second change nobody asked for.
+ */
+export async function putWorkflow(id, snapshot) {
+  const body = { name: snapshot.name, nodes: snapshot.nodes, connections: snapshot.connections };
+  if (snapshot.settings && typeof snapshot.settings === 'object') body.settings = snapshot.settings;
+  return call(`/workflows/${encodeURIComponent(id)}`, { method: 'PUT', body });
+}
+
 /** A workflow's executions, newest first. Only used to find a retry that did not name itself. */
 export async function executionsFor(workflowId, limit = 10) {
   const r = await call(`/executions?workflowId=${encodeURIComponent(workflowId)}&limit=${limit}&includeData=false`);

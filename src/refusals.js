@@ -96,3 +96,32 @@ export function infrastructureFailure({ request, execution } = {}) {
 
   return { refused: false, reason: null, matched: null };
 }
+
+/**
+ * The agent-facing production workflows (28 Sep 2026, Destiny — Agent Upgrade
+ * Plan step 4.4). Every Slack message and every system ask to Bays, North Star
+ * and Research Twin passes through one of these six, so a machine edit that
+ * goes wrong here takes an agent off the air for everyone at once.
+ *
+ * They are not refused: a failure in one still deserves a diagnosis. They are
+ * **proposed, never applied** — the repair runs exactly as a dry run does (the
+ * model may read but not write, and nothing is retried), and the outcome is
+ * `needs_human` carrying the fix it would have made, for a person to review and
+ * apply under the engine change checklist. Matched on id first, because a
+ * rename should not quietly lift the protection, and on name as a backstop.
+ */
+export const PROTECTED_WORKFLOWS = [
+  { id: '134ezjaO6gYqYjez', name: 'Bays — Front Door' },
+  { id: '6S4X6UYtDpETB6u6', name: 'North Star — Front Door' },
+  { id: 'K1iQ72ZTEzQKrxb9', name: 'Research Twin — Front Door' },
+  { id: '5AFqtZQaeKFFiGqe', name: 'Bays — Agent Delivery' },
+  { id: 'cnOz6iomtnWVXjso', name: 'North Star — Agent Delivery' },
+  { id: 'w4SdZjjpokMuWPkV', name: 'Research Twin — Agent Delivery' },
+];
+
+const PROTECTED_IDS = new Set(PROTECTED_WORKFLOWS.map((w) => w.id));
+const PROTECTED_NAMES = new Set(PROTECTED_WORKFLOWS.map((w) => normalizeName(w.name)));
+
+export function isProtectedWorkflow(name, id) {
+  return (id != null && PROTECTED_IDS.has(String(id))) || PROTECTED_NAMES.has(normalizeName(name));
+}
