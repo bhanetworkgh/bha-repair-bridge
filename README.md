@@ -159,6 +159,30 @@ still have reached n8n. Now `n8n-put-workflow.sh` is written as a script that
 exits 3 and calls nothing whenever the run is a dry run or a protected
 workflow. `test/revert.test.js` pins all of this.
 
+## Agents' tools: what the healer fixes, and what it hands to a person (29 September)
+
+An n8n Agent (Bays, North Star, Research Twin) has two kinds of tool, and the
+healer treats them differently.
+
+**A tool that is a workflow** (for example `Bays — Post Loop Digest`,
+`Bays — Slack Send`) is repaired like any workflow, and only that workflow is
+changed: the agent's instructions, skills and tasks are never touched, because
+this service has no way to reach them. The fix is not proved by retrying the
+failed call — its input was the agent's — but by the next real call
+(`repaired_pending`, settled by a second report), and a fix that the next real
+call proves wrong is **reverted to the snapshot automatically**.
+`test/agent-called.test.js` pins that revert
+("an agent tool fix that a later real call proves wrong is reverted…").
+
+**A tool defined inside the agent's own config** (an HTTP or Slack node tool, an
+MCP server) cannot be edited here: n8n's public API, the only one this service
+uses, has no endpoints for Agents. Such a fault surfaces as a `Tool issue` line
+in the agent's answer, which its Agent Delivery workflow raises; Agent
+Deliveries are among the six read-only workflows above, so the healer diagnoses
+it and returns the proposed fix as `needs_human`. A person applies it to the
+agent's draft, tests it and publishes it through the engine change checklist,
+so an agent's live config is never changed by a machine.
+
 ## The four rules that decide an outcome
 
 1. **`repaired` is evidence, not a claim.** It is recorded only where n8n's own

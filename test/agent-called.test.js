@@ -77,7 +77,7 @@ function stubN8n({ failedId, recovery = true, afterPublish = () => {} }) {
   // A different agent run's success, before the fix: never "the same run".
   add(execution({ id: `${failedId}-other`, status: 'success', startedAt: iso(t0 + 5_000), runId: 'run_somebody_else' }));
 
-  const seen = { retries: 0, puts: 0, version: 'v1' };
+  const seen = { retries: 0, puts: 0, version: 'v1', bodies: [] };
   const server = createServer((req, res) => {
     let raw = '';
     req.on('data', (d) => (raw += d));
@@ -91,10 +91,13 @@ function stubN8n({ failedId, recovery = true, afterPublish = () => {} }) {
 
       if (url.pathname === `/api/v1/workflows/${WF}` && req.method === 'PUT') {
         seen.puts++;
-        seen.version = 'v2';
-        // The fix is live from now; say what real traffic does next.
-        afterPublish(add);
-        return send(200, { id: WF, versionId: 'v2' });
+        seen.bodies.push(JSON.parse(raw || '{}'));
+        // Every write moves the version on, as n8n does: the repair to v2, a revert to v3.
+        seen.version = `v${seen.puts + 1}`;
+        // The fix is live from now; say what real traffic does next. Only the repair's
+        // write is "the fix"; a later write is the revert putting it back.
+        if (seen.puts === 1) afterPublish(add);
+        return send(200, { id: WF, versionId: seen.version });
       }
       if (url.pathname === `/api/v1/workflows/${WF}`) return send(200, { ...WORKFLOW, versionId: seen.version });
 
@@ -301,6 +304,38 @@ test('a later real run that fails the same way downgrades it to not_repaired, na
     assert.match(second.human_action, /Execution 38150 .* failed the same way after the fix/);
     assert.equal((await c.webhook.until((b) => b.repair_id === `REP-${WF}-38124` && b.follow_up)).outcome, 'not_repaired');
     assert.equal(c.n8n.seen.retries, 0);
+  } finally {
+    await c.close();
+  }
+});
+
+/**
+ * 29 Sep 2026, loop LOOP-1790676196670-VJTG: an agent's tool, when the tool is a
+ * workflow, is repaired with the tool fix only, and a fix that a later real call
+ * proves wrong is put back. Before this, the path was in the code (the settle step
+ * reverts on not_repaired) but no test held it.
+ */
+test('an agent tool fix that a later real call proves wrong is reverted to the snapshot, and both reports say so', async () => {
+  const c = await runCase({
+    failedId: '68124',
+    afterPublish: (add) => setTimeout(() => add(execution({ id: '68150', status: 'error', startedAt: iso(Date.now()), error: MESSAGE })), 1_500),
+  });
+  try {
+    const first = await c.dashboard.until((b) => b.repair_id === `REP-${WF}-68124`);
+    assert.equal(first.outcome, 'repaired_pending', 'an agent-called tool is not proved by retrying its failed input');
+    assert.equal(first.auto_reverted, false, 'nothing is put back while the proof is pending');
+    const second = await c.dashboard.until((b) => b.repair_id === `REP-${WF}-68124` && b.follow_up);
+    assert.equal(second.outcome, 'not_repaired');
+    assert.equal(second.failed_again.execution_id, '68150');
+    assert.equal(c.n8n.seen.puts, 2, 'the repair wrote once and the revert wrote once');
+    assert.deepEqual(c.n8n.seen.bodies[1].nodes, WORKFLOW.nodes, 'the revert wrote the snapshot taken before the repair');
+    assert.equal(c.n8n.seen.bodies[1].active, undefined, 'active is never sent on a restore');
+    assert.equal(second.auto_reverted, true);
+    assert.equal(second.reverted_to_version, 'v3');
+    assert.equal(second.auto_revert_error, null);
+    const hook = await c.webhook.until((b) => b.repair_id === `REP-${WF}-68124` && b.follow_up);
+    assert.equal(hook.auto_reverted, true, 'the webhook carries the same fact');
+    assert.equal(c.n8n.seen.retries, 0, 'the agent-called execution was never retried');
   } finally {
     await c.close();
   }
