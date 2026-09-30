@@ -32,6 +32,8 @@ Nine incidents, every repair "not repaired", every fix put back. Two causes in t
 1. **A retry cannot prove a fix made upstream of the failed node.** n8n replays from the failed node with the stored output of everything before it, so a fix in an earlier node is never run. The bridge now diffs the workflow before and after (`src/proof.js`); if any changed node is not the failed node or after it, the proof is a later real run (the `repaired_pending` path agent-called workflows already use), not a retry. A later run that fails the same way still reverts.
 2. **A deliberate alarm is not a fault.** A failing node named `Raise ...` (a Code or Stop and Error node) is the workflow raising on purpose so a person is told. It is now `skipped` with the reason, and Claude Code is never started. `Assert ...` nodes are not alarms: they report an upstream fault and are still repaired.
 
+3. **The same diagnosis twice hands over a patch** (`src/repeats.js`). From the second matching diagnosis (same workflow and failed node, root cause overlapping by half, within 48 hours) that did not end in a repair, `human_action` leads with `SAME DIAGNOSIS n TIMES` and a ready-to-apply patch (each changed node with its new code, or the proposed fix where nothing changed), and the body carries `repeat_diagnosis`. A repair that works clears the run.
+
 ## After the 22 September incident
 
 At 08:00 three North Star failures arrived within seconds of each other. The

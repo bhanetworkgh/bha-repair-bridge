@@ -46,7 +46,8 @@ import { errText, log, logError } from './log.js';
 import * as n8n from './n8n.js';
 import { context, prompt, snapshotOf } from './prompt.js';
 import * as queue from './queue.js';
-import { isDeliberateAlarm, retryCanProve } from './proof.js';
+import { changedNodeNames, isDeliberateAlarm, patchText, retryCanProve } from './proof.js';
+import { clearDiagnoses, noteDiagnosis } from './repeats.js';
 import { INFRASTRUCTURE, infrastructureFailure, isProtectedWorkflow, isRefusedWorkflow } from './refusals.js';
 import { failedWriteNote, lastFailedWrite, readCallLog, wroteSuccessfully, writeHelperScripts } from './scripts.js';
 import { reportBoth } from './report.js';
@@ -594,6 +595,7 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
     let verification = null;
     let later = null;
     let publishedAt = null;
+    let afterWf = null;
 
     // A write n8n accepted is reason enough to re-read, whatever the model
     // claimed — including a run that ended without a parseable result.
@@ -603,6 +605,7 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       log(repairId, 'dry_run.no_writes', 'DRY_RUN is on: nothing was written to n8n and no retry was run.');
     } else if (looksChanged) {
       const after = await n8n.workflow(workflowId);
+      afterWf = after;
       versionAfter = str(after?.versionId);
       versionChanged = Boolean(versionAfter && versionBefore && versionAfter !== versionBefore) || Boolean(versionAfter && !versionBefore);
       log(repairId, 'n8n.workflow.reread', { version_before: versionBefore, version_after: versionAfter, changed: versionChanged });
@@ -720,6 +723,28 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       return null;
     })();
 
+    /**
+     * The same diagnosis twice in 48 hours without a repair: hand over the patch (30 Sep 2026).
+     * A repair that worked clears the run. A dry run is not a diagnosis of record.
+     */
+    let repeatDiagnosis = null;
+    if (outcome === 'repaired') {
+      await clearDiagnoses({ workflowId, failedNode });
+    } else if ((outcome === 'not_repaired' || outcome === 'needs_human') && !dryRun()) {
+      const seen = await noteDiagnosis({ workflowId, failedNode, rootCause, repairId });
+      if (seen.count >= 2) {
+        const changed = afterWf ? changedNodeNames(snapshot, afterWf) : [];
+        const patch = changed.length
+          ? patchText(snapshot, afterWf, changed)
+          : str(result?.change_summary) ?? 'No change was made; the root cause above is the diagnosis.';
+        repeatDiagnosis = { occurrences: seen.count, first_seen: seen.since, earlier_repairs: seen.repair_ids, patch };
+        log(repairId, 'repeat_diagnosis', { occurrences: seen.count, earlier: seen.repair_ids });
+      }
+    }
+    const humanActionFinal = repeatDiagnosis
+      ? `SAME DIAGNOSIS ${repeatDiagnosis.occurrences} TIMES, no repair has held, so no further automatic attempt will help. Ready-to-apply patch:\n${repeatDiagnosis.patch}\n\n${humanAction ?? ''}`.trim()
+      : humanAction;
+
     /** Measured once, so a pending repair's second report carries the same duration as its first. */
     const repairMs = Date.now() - t0;
 
@@ -733,7 +758,8 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       rootCause,
       changeSummary,
       nodesChanged: strings(result?.nodes_changed),
-      humanAction,
+      humanAction: humanActionFinal,
+      repeatDiagnosis,
       workflowName: nameFromN8n,
       failedNode,
       versionBefore,
@@ -1085,6 +1111,7 @@ async function finish({
   followUp = false,
   revert = null,
   protectedWorkflow = false,
+  repeatDiagnosis = null,
 }) {
   const finishedAt = new Date().toISOString();
   /** A follow-up report keeps the repair's own duration: a day of watching is not a slow repair. */
@@ -1166,6 +1193,8 @@ async function finish({
     reverted_at: revert?.reverted ? revert.at : null,
     reverted_to_version: revert?.reverted ? revert.version : null,
     auto_revert_error: revert && !revert.reverted ? revert.reason : null,
+    /** 30 Sep 2026: present from the second matching diagnosis that did not end in a repair. */
+    ...(repeatDiagnosis ? { repeat_diagnosis: repeatDiagnosis } : {}),
   };
 
   const webhookBody = {

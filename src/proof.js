@@ -78,3 +78,25 @@ export function isDeliberateAlarm(workflow, failedNode) {
   const node = (workflow?.nodes ?? []).find((n) => n.name === failedNode);
   return Boolean(node && (node.type === 'n8n-nodes-base.stopAndError' || node.type === 'n8n-nodes-base.code'));
 }
+
+/**
+ * The change a repair made, written so a person can paste it: for each changed node, its name
+ * and its new code or parameters. Bounded, because it travels in a Slack report.
+ */
+export function patchText(before, after, names, { limit = 3000 } = {}) {
+  const b = new Map((before?.nodes ?? []).map((n) => [n.name, n]));
+  const a = new Map((after?.nodes ?? []).map((n) => [n.name, n]));
+  const parts = [];
+  for (const name of names) {
+    const node = a.get(name);
+    if (!node) {
+      parts.push(`Node "${name}": remove it${b.has(name) ? '' : ''}.`);
+      continue;
+    }
+    const code = node.parameters?.jsCode;
+    const body = typeof code === 'string' ? `replace its code with:\n${code}` : `set its parameters to:\n${JSON.stringify(node.parameters ?? {}, null, 2)}`;
+    parts.push(`Node "${name}"${b.has(name) ? '' : ' (new)'}: ${body}`);
+  }
+  const text = parts.join('\n\n');
+  return text.length > limit ? `${text.slice(0, limit)}\n[... cut; the full change is in the repair's workflow_before and the workflow history in n8n]` : text;
+}
