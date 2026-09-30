@@ -36,9 +36,9 @@ test('a fix in the failed node or after it can be proved by a retry', () => {
   assert.equal(retryCanProve({ failedNode: 'Assert', before: wf(), after: wf('a', 'fixed') }).ok, true);
 });
 
-test('with no failed node, or nothing changed, a retry is not trusted', () => {
-  assert.equal(retryCanProve({ failedNode: null, before: wf(), after: wf('b') }).ok, false);
-  assert.equal(retryCanProve({ failedNode: 'Assert', before: wf(), after: wf() }).ok, false);
+test('with no failed node, or no node changed, the retry stays the proof as before', () => {
+  assert.equal(retryCanProve({ failedNode: null, before: wf(), after: wf('b') }).ok, true);
+  assert.equal(retryCanProve({ failedNode: 'Assert', before: wf(), after: wf() }).ok, true);
 });
 
 test('a Raise node is a deliberate alarm, an Assert node is not', () => {

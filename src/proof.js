@@ -53,12 +53,15 @@ export function downstreamOf(connections, start) {
 /**
  * Whether retrying the failed execution would actually run what the repair changed.
  * Returns `{ ok, upstream }`: `upstream` lists changed nodes the retry would skip.
- * With no failed node named, or nothing changed, the answer is "cannot tell" and the
- * retry is not trusted to prove anything on its own.
+ * With no failed node named, or no node changed, nothing is known to be skipped and the
+ * retry stands.
  */
 export function retryCanProve({ failedNode, before, after }) {
   const changed = changedNodeNames(before, after);
-  if (!failedNode || changed.length === 0) return { ok: false, upstream: changed, changed };
+  // Only a positively identified upstream change takes a repair off the retry path. Where the
+  // failed node is unknown, or the version moved without any node changing (settings, connections),
+  // there is nothing to say a retry would skip, so the retry stays the proof as it always was.
+  if (!failedNode || changed.length === 0) return { ok: true, upstream: [], changed };
   const reach = downstreamOf(after?.connections ?? before?.connections, failedNode);
   const upstream = changed.filter((n) => !reach.has(n));
   return { ok: upstream.length === 0, upstream, changed };

@@ -42,3 +42,10 @@ test('the patch names each changed node with its new code', () => {
   assert.match(t, /Node "Added" \(new\): set its parameters to:/);
   assert.ok(patchText(before, { nodes: [{ name: 'Build', parameters: { jsCode: 'x'.repeat(5000) } }] }, ['Build'], { limit: 100 }).length < 400);
 });
+
+test('the repeat record never looks like an interrupted repair to the next boot', async () => {
+  process.env.STATE_DIR = await mkdtemp(path.join(tmpdir(), 'repeats-'));
+  await noteDiagnosis({ workflowId: 'W', failedNode: 'A', rootCause: 'the section text passed the slack limit', repairId: 'R1' });
+  const { inFlight } = await import('../src/state.js');
+  assert.deepEqual(await inFlight(), []);
+});

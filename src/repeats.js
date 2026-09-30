@@ -19,7 +19,10 @@ import { stateDir } from './state.js';
 
 const WINDOW_MS = 48 * 60 * 60 * 1000;
 const KEEP = 20;
-const file = () => path.join(stateDir(), 'repeat-diagnoses.json');
+// In its own subdirectory, like `pending/`: state.inFlight() reads every top-level .json in the
+// state dir as an interrupted repair, and this file is not one.
+const dir = () => path.join(stateDir(), 'repeats');
+const file = () => path.join(dir(), 'diagnoses.json');
 
 export function words(text) {
   return new Set(
@@ -50,7 +53,7 @@ async function read() {
 }
 
 async function write(all) {
-  await mkdir(stateDir(), { recursive: true });
+  await mkdir(dir(), { recursive: true });
   await writeFile(file(), JSON.stringify(all));
 }
 
