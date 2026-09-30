@@ -29,7 +29,7 @@ import { claudeModel, env } from './config.js';
  * `GET /health?deep=1` reports the model that actually served the request, so a
  * name OpenRouter does not know shows up there rather than inside a repair.
  */
-export const DEFAULT_MODEL = 'claude-sonnet-5';
+export const DEFAULT_MODEL = 'claude-opus-5-5';
 
 export function model() {
   return env('ANTHROPIC_MODEL') || DEFAULT_MODEL;
@@ -131,7 +131,7 @@ export async function runClaude(options) {
   return first;
 }
 
-function spawnClaude({ prompt, cwd, timeoutMs, tools = null, permissionMode = null, modelOverride = null, extraEnv = {}, onLog = () => {} }) {
+function spawnClaude({ prompt, cwd, timeoutMs, tools = null, permissionMode = null, modelOverride = null, extraEnv = {}, extraArgs = [], onLog = () => {} }) {
   const bin = claudeBin();
   const args = ['-p', '--output-format', 'json'];
 
@@ -143,6 +143,9 @@ function spawnClaude({ prompt, cwd, timeoutMs, tools = null, permissionMode = nu
     args.push('--allowedTools', tools);
     args.push('--permission-mode', permissionMode || env('CLAUDE_PERMISSION_MODE') || DEFAULT_PERMISSION_MODE);
   }
+
+  // Per-run arguments, e.g. the n8n MCP server for a prepare run (30 Sep 2026).
+  if (Array.isArray(extraArgs) && extraArgs.length) args.push(...extraArgs);
 
   const extra = env('CLAUDE_EXTRA_ARGS');
   if (extra) args.push(...extra.split(/\s+/).filter(Boolean));

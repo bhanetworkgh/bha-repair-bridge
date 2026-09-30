@@ -34,6 +34,13 @@ Nine incidents, every repair "not repaired", every fix put back. Two causes in t
 
 3. **The same diagnosis twice hands over a patch** (`src/repeats.js`). From the second matching diagnosis (same workflow and failed node, root cause overlapping by half, within 48 hours) that did not end in a repair, `human_action` leads with `SAME DIAGNOSIS n TIMES` and a ready-to-apply patch (each changed node with its new code, or the proposed fix where nothing changed), and the body carries `repeat_diagnosis`. A repair that works clears the run.
 
+### The same afternoon: Opus, better context, crashes, prepared fixes
+
+4. **Opus.** `DEFAULT_MODEL` is `claude-opus-5-5` (Destiny, 30 Sep); `ANTHROPIC_MODEL` still overrides it.
+5. **More to reason from** (`src/history.js`, `docs/repair-patterns.md`, `pathToFailure` in `src/prompt.js`): this workflow's last six repairs from the dashboard (and which were put back), BHA's n8n and Slack patterns, and every node on the path to the failure with its code and first output, so an Assert failure leads upstream to the node that built the bad data.
+6. **Crashes** (`src/crashes.js`): the first crash of a workflow in 24 hours is retried once after `CRASH_RETRY_DELAY_MS` (default 2 minutes); a second inside 24 hours gets a memory diagnosis, proposed and never written.
+7. **Prepared fixes for the six protected workflows and the agents' own settings** (`src/mcp.js`, `src/prepared.js`). With `N8N_MCP_URL` and `N8N_MCP_TOKEN` set, Claude Code edits a DRAFT through n8n's MCP tools (no publish tool, no Bash), tests it with pinned data, and the bridge verifies the draft, that live did not move (if it did it is put straight back and nothing is offered) and that the named tests are real and passed. It never drafts over someone else's unpublished work. The report carries `prepared_fix`; the dashboard's Repairs tab shows Apply and Discard, which call `POST /prepared/:repairId/apply|discard` (`x-dashboard-key`). Apply re-checks, publishes exactly the tested draft, then proves it by the next real runs (workflow) or an eval run (agent), and republishes the old version on a same-way failure or an eval regression. Watches persist under `applied/` and resume at boot. `/health` reports `n8n_mcp`.
+
 ## After the 22 September incident
 
 At 08:00 three North Star failures arrived within seconds of each other. The

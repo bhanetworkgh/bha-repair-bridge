@@ -106,12 +106,82 @@ export function snapshotOf(workflow) {
  * read and write goes through the two scripts in the working directory. That is
  * the whole point of them — see `scripts.js`.
  */
-export function prompt({ repairId, request, workflow, ctx, files, dryRun, caller = null, recovered = null }) {
+/**
+ * Every node before the failed one, nearest first, with its type, its code or
+ * parameters and the first item it produced (30 Sep 2026). The failed node is
+ * often only where a fault surfaced: Builder Chasers failed in an Assert node
+ * and its cause was two nodes earlier, in the node that built the message.
+ */
+export function pathToFailure({ workflow, execution, nodeName, max = 8 }) {
+  if (!nodeName) return [];
+  const runData = execution?.data?.resultData?.runData ?? {};
+  const byName = new Map((workflow?.nodes ?? []).map((n) => [n.name, n]));
+  const seen = new Set([nodeName]);
+  const out = [];
+  let frontier = [nodeName];
+  while (frontier.length && out.length < max) {
+    const next = [];
+    for (const name of frontier) {
+      for (const feeder of upstreamOf(workflow, name)) {
+        if (seen.has(feeder)) continue;
+        seen.add(feeder);
+        next.push(feeder);
+        const node = byName.get(feeder);
+        const runs = Array.isArray(runData[feeder]) ? runData[feeder] : [];
+        const last = runs[runs.length - 1];
+        const code = node?.parameters?.jsCode;
+        out.push({
+          name: feeder,
+          type: node?.type ?? '(not in the workflow)',
+          ran: Boolean(last),
+          config: typeof code === 'string' ? code : node?.parameters ?? null,
+          first_output: last ? itemsOf(last).slice(0, 1) : [],
+        });
+        if (out.length >= max) break;
+      }
+      if (out.length >= max) break;
+    }
+    frontier = next;
+  }
+  return out;
+}
+
+function pathText(path) {
+  if (!path.length) return '  (no nodes before it)';
+  return path
+    .map((n) => `  - "${n.name}" (${n.type})${n.ran ? '' : ' did NOT run in this execution'}
+    config: ${clip(n.config, 1500).replace(/\n/g, '\n    ')}
+    first item it produced: ${clip(n.first_output, 800).replace(/\n/g, '\n    ')}`)
+    .join('\n');
+}
+
+export function prompt({ repairId, request, workflow, ctx, files, dryRun, caller = null, recovered = null, path = [], history = '  (not read)', crash = null, prepare = null }) {
   const error = request?.error ?? {};
   const wf = request?.workflow ?? {};
   const exec = request?.execution ?? {};
 
-  const writeRules = dryRun
+  const prepareRules = prepare
+    ? `THIS IS A PROTECTED, AGENT-FACING WORKFLOW. NOTHING YOU DO GOES LIVE.
+  You reach n8n through its MCP tools (mcp__n8n__*). Edits there save a DRAFT;
+  nothing is live until a person presses Apply. You have no publish tool.
+
+  ${prepare.workflowEditable ? `You MAY edit workflow ${prepare.workflowId} (and no other) with update_workflow.` : `Do NOT edit workflow ${prepare.workflowId}: it already holds someone else's unpublished draft.`}
+  ${prepare.agent ? (prepare.agent.editable ? `You MAY instead edit the ${prepare.agent.name} agent (${prepare.agent.id}) with get_agent / mutate_agent / validate_agent, if the fault is in the agent's own settings (instructions, a skill, a tool definition).` : `Do NOT edit the ${prepare.agent.name} agent: it already holds unpublished changes.`) : 'There is no agent behind this workflow.'}
+  Change ONE of the two, never both.
+
+  After a workflow edit you MUST test it: prepare_workflow_pin_data, then
+  test_workflow with the trigger pinned to what the failed execution received
+  (read it from execution.json). Read the test's node outputs with
+  get_workflow_execution; a green status alone proves nothing. Put every test
+  execution id in "test_execution_ids". If the test does not pass, fix the draft
+  and test again. The bridge re-reads every one of them itself.
+  After an agent edit, run validate_agent.
+
+  Report "needs_human" in all cases: a person applies the draft. If you could not
+  find the root cause, change nothing.`
+    : null;
+
+  const writeRules = prepareRules ? prepareRules : dryRun
     ? `THIS IS A DRY RUN. You must NOT change anything in n8n.
 
   You may run ./${GET_SCRIPT} to read the workflow.
@@ -173,7 +243,17 @@ THE FAILURE
   Error class:    ${error.class ?? '(unknown)'}
   Severity:       ${error.severity ?? '(unknown)'}${error.subsystem ? `\n  Subsystem:      ${error.subsystem}` : ''}
   Error message:  ${clip(error.message ?? '(none given)', 2000)}
-${callerNote}
+${callerNote}${crash ? `
+THIS EXECUTION CRASHED
+  n8n killed this run (a crash or out of memory), and this workflow has crashed
+  twice in 24 hours. Do not look for a logic bug. Work out where the memory goes
+  and propose the smallest change that reduces it: process in batches (Split in
+  Batches / Loop Over Items), keep only the fields later nodes use, page a large
+  read, or stop carrying binary data. Nothing will be written: report
+  "needs_human" and put the exact proposed change in change_summary.
+  Data each node produced, largest first:
+${crash.map((n) => `    ${n.node}: ${n.items} items, ${n.bytes} bytes`).join('\n') || '    (no run data was kept)'}
+` : ''}
 THE FAILED NODE, AS IT IS CONFIGURED
 ${clip(ctx.node ?? '(the node named above is not in the workflow — that may itself be the problem)')}
 
@@ -186,15 +266,28 @@ ${clip(ctx.input, 3000)}
 WHAT THE NODE PRODUCED
 ${clip(ctx.output, 2000)}
 
+THE PATH THAT LED HERE (nodes before the failed one, nearest first)
+${pathText(path)}
+
+EARLIER REPAIRS OF THIS WORKFLOW (newest first)
+${history}
+
 IN YOUR WORKING DIRECTORY
 ${files.map((f) => `  ${f}`).join('\n')}
 The JSON files hold the whole of what was cut short above. The two .sh scripts
 are how you read and write the workflow — see below.
 
 THE JOB
+0. Read repair-patterns.md first. Every line in it came from a real failure here.
 1. Find the root cause. Read the JSON files; the execution data is all there.
+   The node that failed is often only where the fault surfaced. If it only
+   checks or reports (an "Assert ..." node, a check that throws), follow the
+   path above upstream to the node that produced the bad data, and fix THAT.
 2. Make the SMALLEST fix that addresses that root cause. One node's parameters,
    an expression, a wrong field name — that size of change.
+3. Read the earlier repairs above. Never repeat a change that was put back:
+   it already failed once. If your diagnosis matches an earlier one whose fix
+   did not hold, find what that fix missed.
 
 ${writeRules}
 
@@ -221,7 +314,7 @@ Your last output must be one JSON object and nothing after it:
   "root_cause": "what actually went wrong, in a sentence or two",
   "change_summary": "exactly what you changed, or what you would change",
   "nodes_changed": ["node name", ...],
-  "human_action": "what a person should do, or an empty string if nothing"
+  "human_action": "what a person should do, or an empty string if nothing"${prepare ? ',\n  "test_execution_ids": ["the id of every test_workflow execution you ran"]' : ''}
 }
 
 "repaired" means you changed the workflow and believe the failure is fixed. It is

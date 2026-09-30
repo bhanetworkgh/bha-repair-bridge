@@ -44,10 +44,16 @@ import { dryRun, env, repairTimeoutMs, retryWaitMs, verifyPollMs, verifyWindowMs
 import { runClaude } from './claude.js';
 import { errText, log, logError } from './log.js';
 import * as n8n from './n8n.js';
-import { context, prompt, snapshotOf } from './prompt.js';
+import { context, pathToFailure, prompt, snapshotOf } from './prompt.js';
+import { historyText, pastRepairs } from './history.js';
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import * as queue from './queue.js';
 import { changedNodeNames, isDeliberateAlarm, patchText, retryCanProve } from './proof.js';
 import { clearDiagnoses, noteDiagnosis } from './repeats.js';
+import { crashRetryDelayMs, nodeSizes, noteCrash } from './crashes.js';
+import * as mcp from './mcp.js';
+import { PREPARE_TOOLS, afterPrepare, beforePrepare, discardDraft } from './prepared.js';
 import { INFRASTRUCTURE, infrastructureFailure, isProtectedWorkflow, isRefusedWorkflow } from './refusals.js';
 import { failedWriteNote, lastFailedWrite, readCallLog, wroteSuccessfully, writeHelperScripts } from './scripts.js';
 import { reportBoth } from './report.js';
@@ -244,12 +250,9 @@ export function accept(request) {
    * The execution is checked again once it has been read — this first pass
    * exists so the obvious cases never reach n8n or the queue at all.
    */
-  const infrastructure = infrastructureFailure({ request });
+  const infrastructure = request?.__crash_diagnosis ? { refused: false } : infrastructureFailure({ request });
   if (infrastructure.refused) {
-    return skip('skipped.infrastructure', { matched: infrastructure.matched }, {
-      rootCause: infrastructure.reason,
-      humanAction: 'Look at the instance rather than the workflow: memory, concurrency, and what else was running at the time. If the workflow really does need less memory to run, that is a change for a person to design.',
-    });
+    return handleCrash({ request, repairId, workflowId, executionId, workflowName, startedAt, t0, reason: infrastructure.reason });
   }
 
   const held = queue.heldBy(workflowId);
@@ -390,6 +393,65 @@ function revertAction(revert) {
   return `The change this repair made is still live and did not fix the failure: ${revert.reason}. Put it back from the Repairs tab on the dashboard, or by hand from the workflow's history in n8n.`;
 }
 
+const CRASH_PREFIX = 'PROPOSED ONLY (this workflow crashed twice in 24 hours; nothing was written): ';
+const CRASH_ACTION = 'The workflow crashed twice in 24 hours, so this is not a one-off. The proposal above is aimed at memory: apply it by hand with a named version and a restore point, and watch the next run.';
+
+/**
+ * A crashed or out-of-memory execution (30 Sep 2026). The first in 24 hours for
+ * this workflow is retried once after a pause and reported; a second goes to a
+ * diagnosis run aimed at memory, proposed and never written.
+ */
+function handleCrash({ request, repairId, workflowId, executionId, workflowName, startedAt, t0, reason }) {
+  const count = noteCrash(workflowId);
+  if (count >= 2) {
+    log(repairId, 'crash.repeat', { crashes_24h: count });
+    const held = queue.heldBy(workflowId);
+    if (held) {
+      void finish({ request, repairId, startedAt, t0, outcome: 'skipped', rootCause: reason, changeSummary: `A second crash inside 24 hours, not diagnosed separately: ${held.repair_id} is already ${held.state} for this workflow.`, humanAction: `Read ${held.repair_id}'s report when it lands.`, workflowName });
+      return { repair_id: repairId, accepted: true, skipped: true };
+    }
+    const crashRequest = { ...request, __crash_diagnosis: true };
+    const { position } = queue.enqueue({
+      repairId,
+      workflowId,
+      onStart: () => log(repairId, 'queue.turn', { waited_ms: Date.now() - t0 }),
+      job: () => run({ request: crashRequest, repairId, workflowId, executionId, workflowName, startedAt, t0 }),
+    });
+    return { repair_id: repairId, accepted: true, skipped: false, queue_position: position };
+  }
+
+  return scheduleCrashRetry({ request, repairId, workflowId, executionId, workflowName, startedAt, t0, reason });
+}
+
+function scheduleCrashRetry({ request, repairId, workflowId, executionId, workflowName, startedAt, t0, reason }) {
+  const delay = crashRetryDelayMs();
+  log(repairId, 'crash.retry.scheduled', { in_ms: delay });
+  const timer = setTimeout(async () => {
+    try {
+      const retry = await retryAndWait({ repairId, executionId, workflowId });
+      await finish({
+        request,
+        repairId,
+        startedAt,
+        t0,
+        outcome: retry.passed ? 'skipped' : 'needs_human',
+        rootCause: reason,
+        changeSummary: retry.passed
+          ? `Nothing was changed. The crash looked like a one-off (the first for this workflow in 24 hours), so the run was retried once after ${Math.round(delay / 1000)}s: execution ${retry.executionId} passed.`
+          : `Nothing was changed. The run was retried once after ${Math.round(delay / 1000)}s and did not pass. ${retry.note ?? ''}`.trim(),
+        humanAction: retry.passed ? null : 'The retry after the crash did not pass. Look at the instance (memory, what else was running) and at this workflow\'s data size; a second crash inside 24 hours is diagnosed automatically.',
+        workflowName,
+        retryExecutionId: retry.executionId,
+      });
+    } catch (e) {
+      logError(repairId, 'crash.retry.failed', errText(e));
+      await finish({ request, repairId, startedAt, t0, outcome: 'error', rootCause: reason, changeSummary: `The retry after the crash could not be run: ${errText(e)}`, humanAction: 'Retry the execution by hand.', workflowName }).catch(() => {});
+    }
+  }, delay);
+  timer.unref?.();
+  return { repair_id: repairId, accepted: true, skipped: false, queue_position: 0 };
+}
+
 /** The standing wording for a protected workflow's proposed-only repair. */
 const PROTECTED_PREFIX = 'PROPOSED ONLY (protected agent-facing workflow; nothing was written): ';
 const PROTECTED_ACTION = 'This is one of the six agent-facing workflows (a front door or an agent delivery workflow), which this bridge diagnoses but never edits. Review the proposed fix above, apply it by hand with a named version and a restore point, test it with pinned data, and verify it on the next real run.';
@@ -399,7 +461,10 @@ const PROTECTED_ACTION = 'This is one of the six agent-facing workflows (a front
 async function run({ request, repairId, workflowId, executionId, workflowName, startedAt, t0 }) {
   /** A protected workflow runs exactly as a dry run does: diagnose, never write (28 Sep, plan step 4.4). */
   const protectedWorkflow = isProtectedWorkflow(workflowName, workflowId);
-  const isDryRun = dryRun() || protectedWorkflow;
+  /** A second crash inside 24 hours: diagnosed for memory, proposed, never written (30 Sep 2026). */
+  let crashMode = Boolean(request?.__crash_diagnosis);
+  let proposalOnly = protectedWorkflow || crashMode;
+  let isDryRun = dryRun() || proposalOnly;
   log(repairId, 'start', { workflow_id: workflowId, workflow_name: workflowName, execution_id: executionId, dry_run: isDryRun, protected: protectedWorkflow });
 
   let workspace = null;
@@ -446,25 +511,19 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
      * own status — the reliable version of the check `accept` made on the
      * request. Refused here, Claude Code is never started.
      */
-    const infrastructure = infrastructureFailure({ request, execution: exec });
+    const infrastructure = crashMode ? { refused: false } : infrastructureFailure({ request, execution: exec });
     if (infrastructure.refused) {
-      log(repairId, 'skipped.infrastructure', { matched: infrastructure.matched, status: exec?.status ?? null });
-      await finish({
-        request,
-        repairId,
-        startedAt,
-        t0,
-        outcome: 'skipped',
-        rootCause: infrastructure.reason,
-        changeSummary: `Skipped — ${INFRASTRUCTURE}. The workflow was read and nothing was changed; Claude Code was never started.`,
-        humanAction: 'Look at the instance rather than the workflow: memory, concurrency, and what else was running at the time. If the workflow really does need less memory to run, that is a change for a person to design.',
-        workflowName: nameFromN8n,
-        failedNode,
-        versionBefore,
-        activeBefore,
-        snapshot,
-      });
-      return;
+      // Seen as a crash only once the execution was read: same policy as at the door.
+      if (noteCrash(workflowId) < 2) {
+        await state.clear(repairId).catch(() => {});
+        recorded = false;
+        scheduleCrashRetry({ request, repairId, workflowId, executionId, workflowName: nameFromN8n, startedAt, t0, reason: infrastructure.reason });
+        return;
+      }
+      crashMode = true;
+      proposalOnly = true;
+      isDryRun = true;
+      log(repairId, 'crash.repeat', { at: 'run' });
     }
 
     const ctx = context({ workflow: wf, execution: exec, failedNodeName: failedNode });
@@ -528,14 +587,37 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
     const helpers = await writeHelperScripts({ dir: workspace, workflowId, readOnly: isDryRun });
     const callLog = helpers.log;
 
-    const files = ['workflow.json', 'execution.json', 'failed-node.json', 'error.json', 'request.json', ...helpers.names];
+    /** What was tried before on this workflow, and what BHA has learned about n8n (30 Sep 2026). */
+    const history = await pastRepairs(workflowId);
+    const patterns = await readFile(fileURLToPath(new URL('../docs/repair-patterns.md', import.meta.url)), 'utf8').catch(() => '(the patterns file could not be read)');
+    const path2 = pathToFailure({ workflow: wf, execution: exec, nodeName: ctx.nodeName });
+    log(repairId, 'context', { history: history.ok ? history.repairs.length : history.error, path: path2.map((n) => n.name) });
+
+    const files = ['workflow.json', 'execution.json', 'failed-node.json', 'error.json', 'request.json', 'repair-patterns.md', 'earlier-repairs.json', ...helpers.names];
     await Promise.all([
       writeFile(path.join(workspace, 'workflow.json'), JSON.stringify(wf, null, 2)),
       writeFile(path.join(workspace, 'execution.json'), JSON.stringify(exec, null, 2)),
       writeFile(path.join(workspace, 'failed-node.json'), JSON.stringify({ node: ctx.node, error: ctx.nodeError, input: ctx.input, output: ctx.output }, null, 2)),
       writeFile(path.join(workspace, 'error.json'), JSON.stringify(request?.error ?? {}, null, 2)),
       writeFile(path.join(workspace, 'request.json'), JSON.stringify({ ...request, workflow: request?.workflow, execution: request?.execution }, null, 2)),
+      writeFile(path.join(workspace, 'repair-patterns.md'), patterns),
+      writeFile(path.join(workspace, 'earlier-repairs.json'), JSON.stringify(history, null, 2)),
     ]);
+
+    /**
+     * A protected workflow with n8n's MCP server configured: the fix is drafted,
+     * tested and handed over for Apply rather than only described (30 Sep 2026).
+     */
+    let prepare = null;
+    if (protectedWorkflow && !crashMode && !dryRun() && mcp.configured()) {
+      try {
+        const before = await beforePrepare(workflowId);
+        prepare = { before, sinceMs: Date.now() };
+        log(repairId, 'prepare.before', { workflow_clean: before.workflowClean, agent: before.agent ? { id: before.agent.id, clean: before.agent.clean } : null });
+      } catch (e) {
+        logError(repairId, 'prepare.unavailable', errText(e));
+      }
+    }
 
     const text = prompt({
       repairId,
@@ -546,6 +628,16 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       dryRun: isDryRun,
       caller,
       recovered,
+      path: path2,
+      history: historyText(history),
+      crash: crashMode ? nodeSizes(exec) : null,
+      prepare: prepare
+        ? {
+            workflowId,
+            workflowEditable: prepare.before.workflowClean,
+            agent: prepare.before.agent ? { id: prepare.before.agent.id, name: prepare.before.agent.name, editable: prepare.before.agent.clean } : null,
+          }
+        : null,
     });
 
     log(repairId, 'claude.start', { timeout_ms: repairTimeoutMs(), prompt_chars: text.length, cwd: workspace });
@@ -553,7 +645,9 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       prompt: text,
       cwd: workspace,
       timeoutMs: repairTimeoutMs(),
-      tools: env('CLAUDE_ALLOWED_TOOLS') || 'Bash,Read,Write,Edit,Glob,Grep',
+      tools: prepare ? ['Read', 'Write', 'Edit', 'Glob', 'Grep', ...PREPARE_TOOLS].join(',') : env('CLAUDE_ALLOWED_TOOLS') || 'Bash,Read,Write,Edit,Glob,Grep',
+      // No Bash in a prepare run: the MCP token is in the arguments, and a shell could read them.
+      extraArgs: prepare ? ['--mcp-config', JSON.stringify({ mcpServers: { n8n: mcp.serverConfig() } }), '--strict-mcp-config'] : [],
       extraEnv: {
         // Only what the two scripts read. The model is told never to use these
         // itself, and it has no reason to: the scripts send them.
@@ -566,6 +660,49 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
     log(repairId, 'claude.finished', { ok: claudeRun.ok, ms: claudeRun.ms, model: claudeRun.model, timed_out: claudeRun.timedOut, error: claudeRun.error ?? null });
 
     const result = claudeRun.ok ? extractResult(claudeRun.text) : null;
+
+    /** What the prepare run left behind, checked by this service rather than taken from the model (30 Sep 2026). */
+    let preparedFix = null;
+    let prepareNote = null;
+    if (prepare) {
+      try {
+        const got = await afterPrepare({ repairId, workflowId, before: prepare.before, testIds: result?.test_execution_ids, sinceMs: prepare.sinceMs });
+        const notes = [];
+        if (got.published.length) notes.push(`The live ${got.published.join(' and ')} changed during the run, which a prepare run must never do; ${got.restored.length === got.published.length ? 'it was put straight back' : 'it could NOT all be put back — look now'}.`);
+        notes.push(...got.problems);
+        if (got.published.length) {
+          // A run that published anything has broken the rule the whole path rests on: offer nothing.
+          if (got.workflowDraft) await discardDraft({ kind: 'workflow', workflow_id: workflowId, restore_version: got.workflowDraft.restore_version });
+          if (got.agentDraft) await discardDraft({ kind: 'agent', agent_id: got.agentDraft.agent_id, restore_version: got.agentDraft.restore_version });
+        } else if (got.workflowDraft && got.agentDraft) {
+          await discardDraft({ kind: 'workflow', workflow_id: workflowId, restore_version: got.workflowDraft.restore_version });
+          await discardDraft({ kind: 'agent', agent_id: got.agentDraft.agent_id, restore_version: got.agentDraft.restore_version });
+          notes.push('The run changed both the workflow and the agent; one fix at a time is the rule, so both drafts were thrown away and the change is described above instead.');
+        } else if (got.workflowDraft) {
+          if (got.tests?.passed) {
+            preparedFix = { kind: 'workflow', workflow_id: workflowId, ...got.workflowDraft, tests: got.tests.valid, summary: str(result?.change_summary) };
+          } else {
+            await discardDraft({ kind: 'workflow', workflow_id: workflowId, restore_version: got.workflowDraft.restore_version });
+            notes.push(`A draft was made but no pinned test of it passed (${got.tests?.tests?.length ? got.tests.tests.map((t) => `${t.id}: ${t.status ?? t.error}`).join('; ') : 'none was named'}), so it was thrown away.`);
+          }
+        } else if (got.agentDraft) {
+          if (got.agentDraft.valid) {
+            preparedFix = { kind: 'agent', agent_id: got.agentDraft.agent_id, agent_key: got.agentDraft.agent_key, draft_version: got.agentDraft.draft_version, restore_version: got.agentDraft.restore_version, summary: str(result?.change_summary) };
+          } else {
+            await discardDraft({ kind: 'agent', agent_id: got.agentDraft.agent_id, restore_version: got.agentDraft.restore_version });
+            notes.push('The agent draft did not validate, so it was thrown away.');
+          }
+        } else {
+          if (!prepare.before.workflowClean) notes.push('The workflow already had an unpublished draft (someone else\'s work), so the healer did not draft over it.');
+          if (prepare.before.agent && !prepare.before.agent.clean) notes.push(`The ${prepare.before.agent.name} agent already had unpublished changes, so the healer did not draft over them.`);
+        }
+        prepareNote = notes.join(' ') || null;
+        log(repairId, 'prepare.after', { prepared: preparedFix ? preparedFix.kind : null, note: prepareNote });
+      } catch (e) {
+        logError(repairId, 'prepare.check.failed', errText(e));
+        prepareNote = `The prepared draft could not be checked (${errText(e)}), so nothing is offered to apply. Look at the workflow's and agent's drafts in n8n.`;
+      }
+    }
     const claimed = claimOf(result);
     if (!result) {
       logError(repairId, 'claude.unparseable', { tail: (claudeRun.text || claudeRun.stderr || '').slice(-800) });
@@ -656,7 +793,7 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       pending: verification === 'later_runs' && !later?.passed.length && !later?.failedSame,
     });
     /** A protected workflow's proposal is a person's to apply, which is what needs_human means. */
-    const outcome = protectedWorkflow && !dryRun() ? 'needs_human' : decided;
+    const outcome = proposalOnly && !dryRun() ? 'needs_human' : decided;
 
     /**
      * A change that did not fix the failure is put back (28 Sep, plan step 4.4),
@@ -671,7 +808,8 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
 
     const changeSummary = (() => {
       const said = str(result?.change_summary) ?? (claudeRun.ok ? 'No change was reported.' : 'No change was reported: the run did not finish.');
-      if (isDryRun) return `${protectedWorkflow && !dryRun() ? PROTECTED_PREFIX : 'DRY RUN: '}${said}`;
+      if (preparedFix) return `PREPARED AND TESTED, NOT LIVE (protected; waiting for Apply): ${said}${prepareNote ? ` ${prepareNote}` : ''}`;
+      if (isDryRun) return `${crashMode && !dryRun() ? CRASH_PREFIX : protectedWorkflow && !dryRun() ? PROTECTED_PREFIX : 'DRY RUN: '}${said}${prepareNote ? ` ${prepareNote}` : ''}`;
       const extra = [];
       if (refusedWrite) extra.push(failedWriteNote(refusedWrite));
       if (retryNote) extra.push(retryNote);
@@ -703,6 +841,8 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       /** A workflow left switched off is the most urgent thing a report can say. */
       const stillWrong = restore.changed && !restore.restored ? activeSentence : null;
       if (stillWrong) return said ? `${stillWrong} ${said}` : stillWrong;
+      if (crashMode && !dryRun()) return `${CRASH_ACTION}${said ? ` ${said}` : ''}`;
+      if (preparedFix) return preparedFix.kind === 'agent' ? `A fix to the agent's settings is drafted and validated, and nothing is live. Press Apply on the Repairs tab to publish it: the healer then runs the eval set and puts the old version back if anything that passed before now fails. Or press Discard.` : `A fix is drafted and passed a pinned test (${(preparedFix.tests ?? []).join(', ')}), and nothing is live. Press Apply on the Repairs tab to publish it: the healer then watches real runs and puts the old version back if one fails the same way. Or press Discard.`;
       if (protectedWorkflow && !dryRun()) return PROTECTED_ACTION;
       /** A failed change still live is the next most urgent thing after a workflow left off. */
       const unreverted = revertAction(revert);
@@ -730,7 +870,7 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
     let repeatDiagnosis = null;
     if (outcome === 'repaired') {
       await clearDiagnoses({ workflowId, failedNode });
-    } else if ((outcome === 'not_repaired' || outcome === 'needs_human') && !dryRun()) {
+    } else if ((outcome === 'not_repaired' || outcome === 'needs_human') && !dryRun() && !preparedFix) {
       const seen = await noteDiagnosis({ workflowId, failedNode, rootCause, repairId });
       if (seen.count >= 2) {
         const changed = afterWf ? changedNodeNames(snapshot, afterWf) : [];
@@ -760,6 +900,7 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       nodesChanged: strings(result?.nodes_changed),
       humanAction: humanActionFinal,
       repeatDiagnosis,
+      preparedFix,
       workflowName: nameFromN8n,
       failedNode,
       versionBefore,
@@ -1112,6 +1253,7 @@ async function finish({
   revert = null,
   protectedWorkflow = false,
   repeatDiagnosis = null,
+  preparedFix = null,
 }) {
   const finishedAt = new Date().toISOString();
   /** A follow-up report keeps the repair's own duration: a day of watching is not a slow repair. */
@@ -1195,6 +1337,8 @@ async function finish({
     auto_revert_error: revert && !revert.reverted ? revert.reason : null,
     /** 30 Sep 2026: present from the second matching diagnosis that did not end in a repair. */
     ...(repeatDiagnosis ? { repeat_diagnosis: repeatDiagnosis } : {}),
+    /** 30 Sep 2026: a drafted, tested fix waiting for a person's Apply. Nothing in it is live. */
+    ...(preparedFix ? { prepared_fix: preparedFix, prepared_state: 'pending' } : {}),
   };
 
   const webhookBody = {

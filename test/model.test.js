@@ -50,10 +50,10 @@ const run = (bin, extra = {}) => {
   return runClaude({ prompt: 'say OK', cwd: tmpdir(), timeoutMs: 20_000, ...extra });
 };
 
-test('the pinned model is a current Sonnet and reaches the child process', async () => {
+test('the pinned model is Opus (30 Sep 2026, Destiny) and reaches the child process', async () => {
   delete process.env.ANTHROPIC_MODEL;
   assert.equal(model(), DEFAULT_MODEL);
-  assert.match(DEFAULT_MODEL, /sonnet/);
+  assert.match(DEFAULT_MODEL, /opus/);
 
   const fake = await echoingClaude();
   const r = await run(fake.bin);

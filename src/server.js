@@ -23,6 +23,8 @@ import { deepHealthTimeoutMs, dryRun, env, envMissing, port } from './config.js'
 import { reachable } from './claude.js';
 import { errText, log, logError } from './log.js';
 import { accept, activeRepairs, busy, queued, recover, RequestError, running } from './repair.js';
+import * as prepared from './prepared.js';
+import * as mcp from './mcp.js';
 
 export function createApp() {
   const app = express();
@@ -50,6 +52,8 @@ export function createApp() {
       queued: queued(),
       dry_run: dryRun(),
       env_missing: envMissing(),
+      /** Whether prepared fixes (drafts for protected workflows and agents) can be made (30 Sep 2026). */
+      n8n_mcp: mcp.configured(),
     };
 
     const deep = req.query.deep === '1' || req.query.deep === 'true';
@@ -115,6 +119,34 @@ export function createApp() {
   /** What is running and what is waiting, in order. Useful when a repair seems stuck. */
   app.get('/repairs/active', (_req, res) => res.json({ busy: busy(), ...activeRepairs() }));
 
+  /**
+   * Apply or Discard a prepared fix (30 Sep 2026). Called only by the dashboard's
+   * server, with its own DASHBOARD_INBOUND_KEY, which this service already holds
+   * for its reports. The bridge re-checks everything against n8n before acting.
+   */
+  app.post('/prepared/:repairId/:action', async (req, res) => {
+    const key = env('DASHBOARD_INBOUND_KEY');
+    if (!key || req.get('x-dashboard-key') !== key) return res.status(401).json({ ok: false, message: 'The x-dashboard-key header is missing or wrong.' });
+    const { repairId, action } = req.params ?? {};
+    const id = repairId ?? decodeURIComponent(String(req.path).split('/')[2] ?? '');
+    const act = action ?? String(req.path).split('/')[3];
+    const fix = req.body?.prepared_fix;
+    if (!fix || (fix.kind !== 'workflow' && fix.kind !== 'agent')) return res.status(422).json({ ok: false, message: 'prepared_fix is missing or not a workflow or agent fix.' });
+    try {
+      const out =
+        act === 'apply'
+          ? await prepared.apply({ repairId: id, fix, executionId: req.body?.execution_id, failedNode: req.body?.failed_node })
+          : act === 'discard'
+            ? await prepared.discard({ fix })
+            : { ok: false, message: `No action ${act}; use apply or discard.` };
+      log(id, `prepared.${act}`, { ok: out.ok, message: out.message, by: req.body?.actor ?? null });
+      return res.status(200).json(out);
+    } catch (e) {
+      logError(id, `prepared.${act}.error`, errText(e));
+      return res.status(200).json({ ok: false, message: errText(e) });
+    }
+  });
+
   app.use((req, res) => res.status(404).json({ ok: false, error: `No route ${req.method} ${req.path}. This service has /health and /fix-workflow.` }));
 
   // eslint-disable-next-line no-unused-vars -- express identifies an error handler by its arity
@@ -149,6 +181,7 @@ if (startedDirectly) {
      * two every other repair sends.
      */
     void recover().catch((e) => logError(null, 'recover.error', errText(e)));
+    void prepared.resumeApplied().catch((e) => logError(null, 'prepared.resume.error', errText(e)));
   });
 
   /**

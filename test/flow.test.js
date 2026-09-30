@@ -82,6 +82,8 @@ function collector({ status = 200 } = {}) {
   const bodies = [];
   const waiters = [];
   const server = createServer((req, res) => {
+    // The repair-history read (30 Sep 2026) is a GET; only the reports are recorded.
+    if (req.method === 'GET') { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"repairs":[]}'); return; }
     let raw = '';
     req.on('data', (d) => (raw += d));
     req.on('end', () => {

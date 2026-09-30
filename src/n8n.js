@@ -188,3 +188,21 @@ export async function waitForExecution(id, { timeoutMs, pollMs = 5000, onPoll } 
     await new Promise((r) => setTimeout(r, Math.min(pollMs, Math.max(0, deadline - Date.now()))));
   }
 }
+
+/** Workflows changed since a moment, by id and name (30 Sep 2026: what else a prepare run touched). */
+export async function workflowsUpdatedSince(sinceMs) {
+  const out = [];
+  let cursor = null;
+  for (let page = 0; page < 5; page++) {
+    const q = new URLSearchParams({ limit: '250' });
+    if (cursor) q.set('cursor', cursor);
+    const r = await call(`/workflows?${q.toString()}`);
+    for (const w of Array.isArray(r?.data) ? r.data : []) {
+      const t = Date.parse(w?.updatedAt ?? '');
+      if (Number.isFinite(t) && t >= sinceMs) out.push({ id: String(w.id), name: w.name ?? null });
+    }
+    cursor = r?.nextCursor ?? null;
+    if (!cursor) break;
+  }
+  return out;
+}

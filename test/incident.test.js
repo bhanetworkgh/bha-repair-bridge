@@ -104,6 +104,8 @@ function stubN8n({ executionStatus = 'error', executionError = null, retryStatus
 function collector() {
   const bodies = [];
   const server = createServer((req, res) => {
+    // The repair-history read (30 Sep 2026) is a GET; only the reports are recorded.
+    if (req.method === 'GET') { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"repairs":[]}'); return; }
     let raw = '';
     req.on('data', (d) => (raw += d));
     req.on('end', () => {
@@ -317,51 +319,72 @@ test('2b. a repair that changed nothing about the active state says nothing abou
 
 /* ----------------------------------------------------------------- three */
 
-test('3. a crashed execution is skipped as infrastructure, without starting Claude Code', async () => {
+/*
+ * Crashes (30 Sep 2026, replacing the flat refusal): the first crash of a workflow in 24 hours
+ * is retried once after a pause; a second inside 24 hours is diagnosed for memory, proposed and
+ * never written. Claude Code never starts on a first crash, and nothing is ever written.
+ */
+test('3. a first crash is retried once, reported, and Claude Code never starts', async () => {
+  process.env.CRASH_RETRY_DELAY_MS = '0';
   const marker = path.join(await mkdtemp(path.join(tmpdir(), 'marker-')), 'runs.log');
   const bin = await fakeClaude({ answer: REPAIRED, marker });
   const bridge = await boot({ claudeBin: bin, stub: { executionStatus: 'crashed' } });
+  try {
+    const accepted = await bridge.post(requestFor('ns1', 'North Star — Digest', '701'));
+    assert.equal(accepted.status, 202);
 
-  const accepted = await bridge.post(requestFor('ns1', 'North Star — Digest', '701'));
-  assert.equal(accepted.status, 202);
-
-  const [report] = await bridge.dashboard.waitFor(1);
-  await idle(bridge.health);
-
-  assert.equal(report.outcome, 'skipped');
-  assert.match(report.root_cause, /crashed/);
-  assert.match(report.root_cause, /infrastructure, not a workflow fault/);
-  assert.match(report.change_summary, /infrastructure, not a workflow fault/);
-  assert.match(report.human_action, /instance rather than the workflow/);
-
-  await assert.rejects(readFile(marker, 'utf8'), 'Claude Code was never started');
-  assert.equal(bridge.n8n.seen.puts.length, 0, 'and nothing was written to n8n');
-
-  await bridge.close();
-});
-
-test('3b. an out-of-memory error is skipped before n8n is even read', async () => {
-  const bridge = await boot({ claudeBin: await fakeClaude({ answer: REPAIRED }) });
-
-  for (const [i, message] of [
-    'Execution stopped at this node. n8n may have run out of memory while executing it — possible out-of-memory',
-    'WorkflowCrashedError: the workflow execution crashed',
-  ].entries()) {
-    await bridge.post(requestFor('ns1', 'North Star — Digest', `80${i}`, { error: { class: 'unknown', message, failed_node: 'Map fields', severity: 'critical' } }));
-  }
-
-  const reports = await bridge.dashboard.waitFor(2);
-  await idle(bridge.health);
-
-  for (const report of reports) {
+    const [report] = await bridge.dashboard.waitFor(1);
     assert.equal(report.outcome, 'skipped');
     assert.match(report.root_cause, /infrastructure, not a workflow fault/);
-  }
-  assert.match(reports[0].root_cause, /possible out-of-memory/);
-  assert.match(reports[1].root_cause, /WorkflowCrashedError/);
-  assert.equal(bridge.n8n.seen.reads.length, 0, 'the workflow was never even fetched');
+    assert.match(report.change_summary, /retried once/);
+    assert.match(report.change_summary, /retry-701 passed/);
+    assert.equal(report.human_action, null);
 
-  await bridge.close();
+    await assert.rejects(readFile(marker, 'utf8'), 'Claude Code was never started');
+    assert.equal(bridge.n8n.seen.puts.length, 0, 'and nothing was written to n8n');
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('3b. a retry after a crash that fails again is handed to a person', async () => {
+  process.env.CRASH_RETRY_DELAY_MS = '0';
+  const bridge = await boot({ claudeBin: await fakeClaude({ answer: REPAIRED }), stub: { executionStatus: 'crashed', retryStatus: 'error' } });
+  try {
+    await bridge.post(requestFor('ns2', 'North Star — Ask Router', '702'));
+    const [report] = await bridge.dashboard.waitFor(1);
+    assert.equal(report.outcome, 'needs_human');
+    assert.match(report.change_summary, /did not pass/);
+    assert.equal(bridge.n8n.seen.puts.length, 0);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('3c. a second crash inside 24 hours is diagnosed for memory, proposed, and never written', async () => {
+  process.env.CRASH_RETRY_DELAY_MS = '0';
+  const marker = path.join(await mkdtemp(path.join(tmpdir(), 'marker-')), 'runs.log');
+  const bridge = await boot({ claudeBin: await fakeClaude({ answer: REPAIRED, marker }) });
+  try {
+    for (const [i, message] of [
+      'Execution stopped at this node. n8n may have run out of memory while executing it — possible out-of-memory',
+      'WorkflowCrashedError: the workflow execution crashed',
+    ].entries()) {
+      await bridge.post(requestFor('ns3', 'North Star — Weekly Roll-up', `80${i}`, { error: { class: 'unknown', message, failed_node: 'Map fields', severity: 'critical' } }));
+      await bridge.dashboard.waitFor(i + 1, 30_000);
+    }
+    await idle(bridge.health);
+    const reports = bridge.dashboard.bodies;
+    assert.equal(reports[0].outcome, 'skipped', 'the first is retried');
+    assert.match(reports[0].change_summary, /retried once/);
+    assert.equal(reports[1].outcome, 'needs_human', 'the second is a proposal for a person');
+    assert.match(reports[1].change_summary, /^PROPOSED ONLY \(this workflow crashed twice in 24 hours/);
+    assert.match(reports[1].human_action, /crashed twice in 24 hours/);
+    assert.ok((await readFile(marker, 'utf8')).length > 0, 'Claude Code ran for the diagnosis');
+    assert.equal(bridge.n8n.seen.puts.length, 0, 'nothing was written');
+  } finally {
+    await bridge.close();
+  }
 });
 
 /* ------------------------------------------------------------------ four */
