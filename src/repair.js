@@ -46,6 +46,7 @@ import { errText, log, logError } from './log.js';
 import * as n8n from './n8n.js';
 import { context, prompt, snapshotOf } from './prompt.js';
 import * as queue from './queue.js';
+import { isDeliberateAlarm, retryCanProve } from './proof.js';
 import { INFRASTRUCTURE, infrastructureFailure, isProtectedWorkflow, isRefusedWorkflow } from './refusals.js';
 import { failedWriteNote, lastFailedWrite, readCallLog, wroteSuccessfully, writeHelperScripts } from './scripts.js';
 import { reportBoth } from './report.js';
@@ -469,6 +470,30 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
     failedNode = ctx.nodeName ?? failedNode;
 
     /**
+     * A "Raise ..." node failing is the workflow doing its job (30 Sep 2026): the throw is the
+     * alarm, raised on purpose so the error handler tells a person. Not sent to Claude Code.
+     */
+    if (isDeliberateAlarm(wf, failedNode)) {
+      log(repairId, 'skipped.deliberate_alarm', { failed_node: failedNode });
+      await finish({
+        request,
+        repairId,
+        startedAt,
+        t0,
+        outcome: 'skipped',
+        rootCause: `"${failedNode}" is a deliberate alarm: it throws on purpose so a person is told. The workflow behaved as designed, so there is no defect here for a repair to fix. The error message names what it is reporting.`,
+        changeSummary: 'Skipped as a working-as-designed alarm. The workflow was read and nothing was changed; Claude Code was never started.',
+        humanAction: 'Read the error message: it says what happened (for example a refused click and who made it). If it is expected, close the incident as manually resolved; if it is not, act on the event it names.',
+        workflowName: nameFromN8n,
+        failedNode,
+        versionBefore,
+        activeBefore,
+        snapshot,
+      });
+      return;
+    }
+
+    /**
      * Who called this execution, and whether the caller got past it (26 Sep
      * 2026). An agent's tool call that failed once and succeeded moments later
      * in the same agent run is worth saying in the report — and the model is
@@ -585,7 +610,7 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       if (!versionChanged) {
         versionAfter = null;
         retryNote = 'The workflow’s version did not move, so nothing was actually changed in n8n and there was nothing to retry.';
-      } else if (caller.called) {
+      } else if (caller.called || !retryCanProve({ failedNode, before: snapshot, after }).ok) {
         /**
          * Called by an agent or another workflow: retrying would replay the
          * caller's input, so the proof is a real run after the new version was
@@ -890,7 +915,9 @@ function calledBy(caller) {
 /** The sentence that says how the fix was proved, or why it is not proved yet. */
 function proofNote({ outcome, verification, later, publishedAt, verifyUntil, executionId, caller }) {
   if (verification !== 'later_runs' || !later) return null;
-  const why = `Execution ${executionId} was not retried: it was ${calledBy(caller)}, so a retry would only replay that call's input.`;
+  const why = caller?.called
+    ? `Execution ${executionId} was not retried: it was ${calledBy(caller)}, so a retry would only replay that call's input.`
+    : `Execution ${executionId} was not retried: the fix changed a node before the one that failed, and a retry replays the old stored output from the failed node onward, so it would never run the change.`;
   if (later.failedSame) {
     return `${why} A real run after the fix (published ${hhmm(publishedAt)}) failed the same way: execution ${later.failedSame.execution_id} at ${hhmm(later.failedSame.started_at)}.`;
   }
