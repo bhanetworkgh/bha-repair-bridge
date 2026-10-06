@@ -71,7 +71,8 @@ export async function reportBoth({ repairId, dashboardBody, webhookBody }) {
     logError(repairId, 'report.webhook.unconfigured', { missing: ['REPORT_WEBHOOK_URL'], body: webhookBody });
     tasks.push(Promise.resolve({ ok: false, status: 0, attempts: 0, error: 'REPORT_WEBHOOK_URL is not set' }));
   } else {
-    tasks.push(post(hook, {}, webhookBody, { repairId, label: 'webhook' }));
+    // 6 Oct 2026: the n8n report webhook checks x-dashboard-key. It was open until then.
+    tasks.push(post(hook, key ? { 'x-dashboard-key': key } : {}, webhookBody, { repairId, label: 'webhook' }));
   }
 
   const [dashboard, webhook] = await Promise.all(tasks);
