@@ -148,13 +148,24 @@ export async function agentRecovery({ workflowId, failed }) {
  * `sinceMs`, oldest first; `failedSame` is the first one that failed the way
  * the original did. Runs still going are left for the next check.
  */
-export async function laterRuns({ workflowId, sinceMs, signature, excludeIds = [] }) {
+/**
+ * `reachNodes` (20 Oct 2026, INC-BAYS.CODEX-035): the nodes the fix changed. A later
+ * run counts as proof only if at least one of them actually ran in it. Ahad's log
+ * (execution 43198) succeeded after the Layer 2 fix but stopped at Layer 1, so it
+ * never touched the changed node, and it settled the repair as `repaired` anyway.
+ * A run that never reached the change proves nothing about it: it goes into
+ * `notReached`, beside `refused`, and is never counted as passed. With no
+ * `reachNodes` (an older watch, or a fix that named none) the old rule stands.
+ */
+export async function laterRuns({ workflowId, sinceMs, signature, excludeIds = [], reachNodes = [] }) {
+  const reach = [...new Set((reachNodes ?? []).map(String).filter(Boolean))];
   const skip = new Set(excludeIds.map(String));
   const runs = (await n8n.executionsSince(workflowId, sinceMs)).filter((e) => !skip.has(String(e.id)) && !NOT_REAL.has(String(e.mode ?? '').toLowerCase()) && n8n.isFinal(e.status));
 
   const passed = [];
   const refused = [];
   const otherFailures = [];
+  const notReached = [];
   let failedSame = null;
   let reads = 0;
 
@@ -166,7 +177,12 @@ export async function laterRuns({ workflowId, sinceMs, signature, excludeIds = [
     if (n8n.succeeded(e.status)) {
       const why = whole ? refusalOf(whole) : null;
       if (why) refused.push({ ...at, refusal: why });
-      else passed.push(at);
+      else if (reach.length) {
+        const ran = ranNodes(whole);
+        if (!ran) notReached.push({ ...at, reason: 'its run data could not be read, so whether it reached the change is unknown' });
+        else if (reach.some((n) => ran.has(n))) passed.push({ ...at, reached: reach.filter((n) => ran.has(n)) });
+        else notReached.push({ ...at, reason: `it stopped at ${whole?.data?.resultData?.lastNodeExecuted ?? 'an earlier step'} and never ran ${reach.join(', ')}` });
+      } else passed.push(at);
     } else if (whole && sameFailure(failureSignature(whole), signature)) {
       failedSame = { ...at, status: String(e.status) };
       break;
@@ -174,7 +190,14 @@ export async function laterRuns({ workflowId, sinceMs, signature, excludeIds = [
       otherFailures.push({ ...at, status: String(e.status) });
     }
   }
-  return { passed, refused, otherFailures, failedSame };
+  return { passed, refused, otherFailures, failedSame, notReached };
+}
+
+/** The names of the nodes that ran in an execution, or null when its run data is not there to read. */
+export function ranNodes(whole) {
+  const runData = whole?.data?.resultData?.runData;
+  if (!runData || typeof runData !== 'object') return null;
+  return new Set(Object.keys(runData));
 }
 
 /** `18142 at 12:11:26Z` — the form an execution is named in, everywhere a report names one. */

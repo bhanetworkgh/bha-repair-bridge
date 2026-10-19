@@ -680,7 +680,7 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
           notes.push('The run changed both the workflow and the agent; one fix at a time is the rule, so both drafts were thrown away and the change is described above instead.');
         } else if (got.workflowDraft) {
           if (got.tests?.passed) {
-            preparedFix = { kind: 'workflow', workflow_id: workflowId, ...got.workflowDraft, tests: got.tests.valid, summary: str(result?.change_summary) };
+            preparedFix = { kind: 'workflow', workflow_id: workflowId, ...got.workflowDraft, tests: got.tests.valid, summary: str(result?.change_summary), reach_nodes: strings(result?.nodes_changed) };
           } else {
             await discardDraft({ kind: 'workflow', workflow_id: workflowId, restore_version: got.workflowDraft.restore_version });
             notes.push(`A draft was made but no pinned test of it passed (${got.tests?.tests?.length ? got.tests.tests.map((t) => `${t.id}: ${t.status ?? t.error}`).join('; ') : 'none was named'}), so it was thrown away.`);
@@ -733,6 +733,8 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
     let later = null;
     let publishedAt = null;
     let afterWf = null;
+    /** The nodes the fix changed: a later run proves the fix only if it ran one of them. */
+    let reachNodes = [];
 
     // A write n8n accepted is reason enough to re-read, whatever the model
     // claimed — including a run that ended without a parseable result.
@@ -759,8 +761,10 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
          */
         verification = 'later_runs';
         publishedAt = publishTime(calls);
-        later = await laterRunsOrNothing({ repairId, workflowId, sinceMs: Date.parse(publishedAt), signature, executionId });
-        log(repairId, 'verify.later_runs', { published_at: publishedAt, passed: later.passed.map((r) => r.execution_id), failed_same: later.failedSame?.execution_id ?? null });
+        reachNodes = changedNodeNames(snapshot, after);
+        if (!reachNodes.length) reachNodes = strings(result?.nodes_changed);
+        later = await laterRunsOrNothing({ repairId, workflowId, sinceMs: Date.parse(publishedAt), signature, executionId, reachNodes });
+        log(repairId, 'verify.later_runs', { published_at: publishedAt, reach_nodes: reachNodes, passed: later.passed.map((r) => r.execution_id), not_reached: (later.notReached ?? []).map((r) => r.execution_id), failed_same: later.failedSame?.execution_id ?? null });
       } else {
         verification = 'retry';
         const retry = await retryAndWait({ repairId, executionId, workflowId });
@@ -934,6 +938,7 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
         since_ms: Date.parse(publishedAt),
         until: verifyUntil,
         signature,
+        reach_nodes: reachNodes,
         report: {
           request,
           startedAt,
@@ -1062,12 +1067,12 @@ function publishTime(calls) {
 }
 
 /** One look at the runs after the fix. A read that fails is "nothing yet", never a verdict. */
-async function laterRunsOrNothing({ repairId, workflowId, sinceMs, signature, executionId }) {
+async function laterRunsOrNothing({ repairId, workflowId, sinceMs, signature, executionId, reachNodes = [] }) {
   try {
-    return await laterRuns({ workflowId, sinceMs, signature, excludeIds: [executionId] });
+    return await laterRuns({ workflowId, sinceMs, signature, excludeIds: [executionId], reachNodes });
   } catch (e) {
     logError(repairId, 'verify.later_runs.unread', errText(e));
-    return { passed: [], refused: [], otherFailures: [], failedSame: null, unread: errText(e) };
+    return { passed: [], refused: [], otherFailures: [], failedSame: null, notReached: [], unread: errText(e) };
   }
 }
 
@@ -1088,13 +1093,22 @@ function proofNote({ outcome, verification, later, publishedAt, verifyUntil, exe
   if (later.failedSame) {
     return `${why} A real run after the fix (published ${hhmm(publishedAt)}) failed the same way: execution ${later.failedSame.execution_id} at ${hhmm(later.failedSame.started_at)}.`;
   }
+  const skipped = later.notReached?.length
+    ? ` ${later.notReached.length === 1 ? 'One later run' : `${later.notReached.length} later runs`} did not count, because ${later.notReached.length === 1 ? 'it' : 'they'} never reached the changed step: ${later.notReached.map((r) => `${r.execution_id} (${r.reason})`).join('; ')}.`
+    : '';
   if (later.passed.length) {
-    return `${why} Verified by ${later.passed.length === 1 ? 'a later real run' : `${later.passed.length} later real runs`} after the fix was published at ${hhmm(publishedAt)}: execution ${named(later.passed)}.`;
+    return `${why} Verified by ${later.passed.length === 1 ? 'a later real run' : `${later.passed.length} later real runs`} after the fix was published at ${hhmm(publishedAt)}: execution ${named(later.passed)}${reachedNote(later.passed)}.${skipped}`;
   }
   if (outcome === 'repaired_pending') {
-    return `${why} No real run has started since the fix was published at ${hhmm(publishedAt)}, so it is not proved yet. The bridge checks every ${Math.round(verifyPollMs() / 60000)} minutes until ${hhmm(verifyUntil)} and will send a second report.`;
+    return `${why} No real run has started since the fix was published at ${hhmm(publishedAt)}, so it is not proved yet. The bridge checks every ${Math.round(verifyPollMs() / 60000)} minutes until ${hhmm(verifyUntil)} and will send a second report.${skipped}`;
   }
-  return why;
+  return `${why}${skipped}`;
+}
+
+/** Which changed step each proving run went through, so the proof names it. */
+function reachedNote(runs) {
+  const names = [...new Set(runs.flatMap((r) => r.reached ?? []))];
+  return names.length ? `, which ran the changed step ${names.join(', ')}` : '';
 }
 
 function recoveredNote(r) {
@@ -1131,10 +1145,10 @@ export function watchForProof(watch, { pollMs = verifyPollMs() } = {}) {
   log(watch.repair_id, 'verify.watching', { since: new Date(watch.since_ms).toISOString(), until: watch.until, every_ms: pollMs });
 
   const tick = async () => {
-    const later = await laterRunsOrNothing({ repairId: watch.repair_id, workflowId: watch.workflow_id, sinceMs: watch.since_ms, signature: watch.signature, executionId: watch.execution_id });
+    const later = await laterRunsOrNothing({ repairId: watch.repair_id, workflowId: watch.workflow_id, sinceMs: watch.since_ms, signature: watch.signature, executionId: watch.execution_id, reachNodes: watch.reach_nodes ?? [] });
     const settled = later.passed.length > 0 || Boolean(later.failedSame);
     const over = Date.now() >= deadline;
-    log(watch.repair_id, 'verify.check', { passed: later.passed.map((r) => r.execution_id), failed_same: later.failedSame?.execution_id ?? null, over });
+    log(watch.repair_id, 'verify.check', { passed: later.passed.map((r) => r.execution_id), not_reached: (later.notReached ?? []).map((r) => r.execution_id), failed_same: later.failedSame?.execution_id ?? null, over });
 
     if (!settled && !over) {
       entry.timer = setTimeout(tick, Math.min(pollMs, Math.max(0, deadline - Date.now())));
@@ -1166,7 +1180,7 @@ async function settle(watch, later) {
     extra.push(
       later.unread
         ? `n8n could not be read at the last check (${later.unread}), so nothing after the fix could be judged.`
-        : `No real run of the workflow started between ${hhmm(r.publishedAt)} and ${hhmm(watch.until)}${later.refused.length ? ` (only ${later.refused.length} that refused its input: ${named(later.refused)})` : ''}${later.otherFailures.length ? `, and ${later.otherFailures.length} that failed some other way: ${named(later.otherFailures)}` : ''}.`,
+        : `No real run of the workflow started between ${hhmm(r.publishedAt)} and ${hhmm(watch.until)}${later.refused.length ? ` (only ${later.refused.length} that refused its input: ${named(later.refused)})` : ''}${later.otherFailures.length ? `, and ${later.otherFailures.length} that failed some other way: ${named(later.otherFailures)}` : ''}${later.notReached?.length ? `, and ${later.notReached.length} that succeeded without reaching the changed step: ${named(later.notReached)}` : ''}.`,
     );
   }
   if (r.agentRecovered) extra.push(recoveredNote(r.agentRecovered));
@@ -1182,7 +1196,7 @@ async function settle(watch, later) {
     outcome === 'not_repaired'
       ? [revertAction(revert), sameFailureAction(later.failedSame, r.workflowName)].filter(Boolean).join(' ')
       : outcome === 'needs_human'
-        ? `Unverified: whether the fix published at ${hhmm(r.publishedAt)} holds for a real call — nothing has called ${r.workflowName || 'the workflow'} since${later.unread ? ' that n8n would show this bridge' : ''}. The next real call settles it; if one is expected soon, look at that execution when it arrives.`
+        ? `Unverified: whether the fix published at ${hhmm(r.publishedAt)} holds for a real call — ${later.notReached?.length ? `${r.workflowName || 'the workflow'} ran since, but no run reached the changed step` : `nothing has called ${r.workflowName || 'the workflow'} since${later.unread ? ' that n8n would show this bridge' : ''}`}. The next real call that reaches it settles it; if one is expected soon, look at that execution when it arrives.`
         : null;
 
   await finish({

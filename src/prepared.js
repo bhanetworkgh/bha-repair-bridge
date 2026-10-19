@@ -295,7 +295,7 @@ export function watchWorkflow(watch, { pollMs = verifyPollMs() } = {}) {
   const tick = async () => {
     let later;
     try {
-      later = await laterRuns({ workflowId: watch.fix.workflow_id, sinceMs: watch.since_ms, signature: watch.signature, excludeIds: [watch.execution_id] });
+      later = await laterRuns({ workflowId: watch.fix.workflow_id, sinceMs: watch.since_ms, signature: watch.signature, excludeIds: [watch.execution_id], reachNodes: watch.fix.reach_nodes ?? [] });
     } catch (e) {
       later = { passed: [], failedSame: null, unread: errText(e) };
     }
@@ -314,7 +314,8 @@ export function watchWorkflow(watch, { pollMs = verifyPollMs() } = {}) {
       return forget(watch.repair_id);
     }
     if (Date.now() >= deadline) {
-      await postOutcome(watch.repair_id, { state: 'unproven', message: 'The fix is live, but no real run happened inside the watch window, so it is not proved either way.' });
+      const skipped = later.notReached?.length ? ` ${later.notReached.length} later run(s) succeeded without reaching the changed step and do not count: ${named(later.notReached)}.` : '';
+      await postOutcome(watch.repair_id, { state: 'unproven', message: `The fix is live, but no real run that reached the changed step happened inside the watch window, so it is not proved either way.${skipped}`, evidence: later.notReached?.length ? { not_reached: later.notReached } : undefined });
       return forget(watch.repair_id);
     }
     const t = setTimeout(tick, Math.min(pollMs, Math.max(1000, deadline - Date.now())));

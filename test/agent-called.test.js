@@ -40,7 +40,7 @@ const WORKFLOW = {
 const iso = (ms) => new Date(ms).toISOString();
 
 /** An execution as n8n's public API returns it, with the fields the bridge reads. */
-function execution({ id, status, startedAt, mode = 'integrated', runId = RUN, input = {}, error = null, output = null }) {
+function execution({ id, status, startedAt, mode = 'integrated', runId = RUN, input = {}, error = null, output = null, ran = null }) {
   const lastNode = error ? 'Render Digest Blocks' : 'Return Result';
   return {
     id,
@@ -54,7 +54,8 @@ function execution({ id, status, startedAt, mode = 'integrated', runId = RUN, in
       resultData: {
         lastNodeExecuted: lastNode,
         ...(error ? { error: { message: error } } : {}),
-        runData: {
+        // `ran` names the only nodes that ran: a run that stopped before the changed step.
+        runData: ran ? Object.fromEntries(ran.map((n) => [n, [{ data: { main: [[{ json: {} }]] } }]])) : {
           'From Bays Agent': [{ data: { main: [[{ json: input }]] } }],
           [lastNode]: [error ? { error: { message: error }, data: { main: [[]] } } : { data: { main: [[{ json: output ?? { ok: true, posted: true } }]] } }],
         },
@@ -362,6 +363,45 @@ test('a run that only refused its input is not proof; a day with no real run ask
     assert.match(second.human_action, /^Unverified: whether the fix published at .* holds for a real call/);
     await c.webhook.until((b) => b.repair_id === `REP-${WF}-48124` && b.follow_up);
     assert.equal(c.n8n.seen.retries, 0);
+  } finally {
+    await c.close();
+  }
+});
+
+test('20 Oct (CODEX-035): a later success that never ran the changed step is not proof, and the report names it', async () => {
+  const c = await runCase({
+    failedId: '43048',
+    recovery: false,
+    windowMs: 4_000,
+    // Ahad's log 43198: it succeeded, but stopped at an earlier step and never ran the fix.
+    afterPublish: (add) => add(execution({ id: '43198', status: 'success', startedAt: iso(Date.now() + 1_500), ran: ['Webhook', 'Filter - Layer 0 Failed'] })),
+  });
+  try {
+    const first = await c.dashboard.until((b) => b.repair_id === `REP-${WF}-43048`);
+    assert.equal(first.outcome, 'repaired_pending', 'a run that skipped the change does not settle it');
+
+    const second = await c.dashboard.until((b) => b.repair_id === `REP-${WF}-43048` && b.follow_up);
+    assert.equal(second.outcome, 'needs_human');
+    assert.deepEqual(second.verified_by, [], '43198 is never counted as proof');
+    assert.match(second.change_summary, /did not count, because it never reached the changed step: 43198 \(it stopped at Filter - Layer 0 Failed and never ran From Bays Agent\)/);
+    assert.match(second.change_summary, /succeeded without reaching the changed step: 43198/);
+    assert.match(second.human_action, /no run reached the changed step/);
+  } finally {
+    await c.close();
+  }
+});
+
+test('a later success that did run the changed step is proof, and the report names the step', async () => {
+  const c = await runCase({
+    failedId: '43049',
+    recovery: false,
+    afterPublish: (add) => add(execution({ id: '43301', status: 'success', startedAt: iso(Date.now() + 1_500) })),
+  });
+  try {
+    const first = await c.dashboard.until((b) => b.repair_id === `REP-${WF}-43049`);
+    assert.equal(first.outcome, 'repaired');
+    assert.deepEqual(first.verified_by.map((r) => r.execution_id), ['43301']);
+    assert.match(first.change_summary, /execution 43301 at .*, which ran the changed step From Bays Agent\./);
   } finally {
     await c.close();
   }
