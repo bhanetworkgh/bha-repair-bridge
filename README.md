@@ -122,7 +122,14 @@ So, for an execution another agent or workflow called (mode `integrated`, or a
 - **It is never retried.** The proof is a later real run: a successful
   execution of the workflow that started after the fixed version was
   published (retries and manual runs do not count, and nor does a run that
-  answered `ok: false` — a refusal did no work).
+  answered `ok: false` — a refusal did no work). **It must also have run a
+  node the fix changed** (20 Oct 2026, INC-BAYS.CODEX-035): Ahad's log 43198
+  succeeded after the Submit Actions fix but stopped at Layer 1 and never ran
+  "Build Layer 2 Payload", and it was taken as proof. The changed nodes come
+  from the workflow before and after (else the model's `nodes_changed`); a
+  success that ran none of them, or whose run data cannot be read, is listed
+  as not reaching the change and never counted. The report names the changed
+  step each proving run went through.
 - **The queue is not held for it.** If no such run exists yet, the repair is
   reported at once as **`repaired_pending`**, and a background watch looks
   every 10 minutes for up to 24 hours. It sends a **second report** with the
