@@ -91,6 +91,46 @@ export const DEFAULT_PERMISSION_MODE = 'acceptEdits';
 const ROOT_REFUSAL = /root\/sudo privileges/i;
 
 /**
+ * OpenRouter refusing for want of credit (27 Oct 2026), the way it reached this
+ * service on 26 Oct: "API Error: 402 ... billing_error ... can only afford
+ * 18201". Bays, North Star, Research Twin and the eval runner already fall back
+ * to Anthropic on this; the bridge had no backup, so it could not repair at all
+ * while OpenRouter was dry (LOOP-1793025371486-STVC).
+ */
+export const CREDIT_REFUSAL = /(\b402\b|billing_error|payment required|can only afford|insufficient (credits|balance|funds)|exceed your available credits|credit balance is too low|requires more credits)/i;
+
+/** Whether the Anthropic backup is set on this service. Without it a credit refusal is reported as before. */
+export function backupConfigured() {
+  return Boolean(env('ANTHROPIC_BACKUP_API_KEY'));
+}
+
+/**
+ * The model the backup asks Anthropic for. Anthropic's own names have no
+ * provider prefix and use dashes, so an OpenRouter-style pin such as
+ * `anthropic/claude-sonnet-4.5` is turned into `claude-sonnet-4-5`.
+ * `ANTHROPIC_BACKUP_MODEL` overrides it.
+ */
+export function backupModel() {
+  const set = env('ANTHROPIC_BACKUP_MODEL');
+  if (set) return set;
+  return model().replace(/^anthropic\//, '').replace(/\./g, '-');
+}
+
+/** The environment that sends the CLI straight to Anthropic on the backup key. */
+function backupEnv() {
+  return {
+    ANTHROPIC_BASE_URL: env('ANTHROPIC_BACKUP_BASE_URL') || 'https://api.anthropic.com',
+    ANTHROPIC_AUTH_TOKEN: '',
+    ANTHROPIC_API_KEY: env('ANTHROPIC_BACKUP_API_KEY') ?? '',
+  };
+}
+
+/** One run on the backup, with the caller's own environment kept (the n8n scripts need it). */
+export function runOnBackup(options) {
+  return spawnClaude({ ...options, extraEnv: { ...(options.extraEnv ?? {}), ...backupEnv() }, modelOverride: backupModel(), modelArg: env('CLAUDE_MODEL') ? backupModel() : null });
+}
+
+/**
  * An answer that means the model name itself was refused — a 404 or
  * not_found_error from OpenRouter naming the model, rather than anything the
  * run did.
@@ -104,7 +144,8 @@ const UNKNOWN_MODEL = /(not_found_error|404).*model|model.*(not found|not_found_
  */
 export async function runClaude(options) {
   const first = await spawnClaude(options);
-  if (first.ok) return first;
+  // An envelope can report ok with an error inside it; a credit refusal there still falls back below.
+  if (first.ok && !(first.error && CREDIT_REFUSAL.test(`${first.error} ${first.text ?? ''}`))) return { ...first, provider: 'openrouter' };
 
   const said = `${first.error ?? ''} ${first.stderr ?? ''}`;
 
@@ -128,14 +169,39 @@ export async function runClaude(options) {
     return { ...second, ms: second.ms + first.ms, modelFallback: true };
   }
 
-  return first;
+  /**
+   * OpenRouter out of credit, retried once on the Anthropic backup (27 Oct
+   * 2026). Never a run that may already have changed something: a run with
+   * tools is re-run only when the caller's `canRetry` says nothing was written
+   * (the repair reads n8n's own call log for that), and without a `canRetry`
+   * only when the first run produced no output at all, as above. A refusal the
+   * backup cannot take is reported exactly as before, with the reason named.
+   */
+  const refusal = `${first.error ?? ''} ${first.stderr ?? ''} ${first.text ?? ''}`;
+  if ((!first.ok || first.error) && CREDIT_REFUSAL.test(refusal)) {
+    if (!backupConfigured()) {
+      options.onLog?.('OpenRouter refused for credit and no Anthropic backup is set on this service (ANTHROPIC_BACKUP_API_KEY), so the run is reported as it failed');
+      return { ...first, provider: 'openrouter', backupSkipped: 'not_configured' };
+    }
+    const safe = !options.tools ? true : options.canRetry ? await options.canRetry(first) : !first.text;
+    if (!safe) {
+      options.onLog?.('OpenRouter refused for credit after the run had already written to n8n, so it is not re-run on the backup: a second run could write twice');
+      return { ...first, provider: 'openrouter', backupSkipped: 'already_wrote' };
+    }
+    options.onLog?.(`OpenRouter refused for credit; re-running on the Anthropic backup (${backupModel()})`);
+    const second = await runOnBackup(options);
+    return { ...second, ms: second.ms + first.ms, provider: 'anthropic_backup', providerFallback: true, primaryError: (first.error || '').slice(0, 600) };
+  }
+
+  return { ...first, provider: 'openrouter' };
 }
 
-function spawnClaude({ prompt, cwd, timeoutMs, tools = null, permissionMode = null, modelOverride = null, extraEnv = {}, extraArgs = [], onLog = () => {} }) {
+function spawnClaude({ prompt, cwd, timeoutMs, tools = null, permissionMode = null, modelOverride = null, modelArg = undefined, extraEnv = {}, extraArgs = [], onLog = () => {} }) {
   const bin = claudeBin();
   const args = ['-p', '--output-format', 'json'];
 
-  const model = claudeModel();
+  // The backup names its own model: CLAUDE_MODEL is an OpenRouter name and Anthropic would refuse it.
+  const model = modelArg !== undefined ? modelArg : claudeModel();
   if (model) args.push('--model', model);
 
   if (tools) {
@@ -256,20 +322,29 @@ export function readEnvelope(stdout) {
  * No tools, one word asked for, a minute at most. It is the thing to run before
  * trusting a repair, and it says what went wrong rather than just false.
  */
-export async function reachable(timeoutMs) {
-  const r = await runClaude({
+export async function reachable(timeoutMs, { provider = null } = {}) {
+  const ask = {
     prompt: 'reply with the single word OK',
     cwd: process.env.TMPDIR || '/tmp',
     timeoutMs,
     tools: null,
-  });
+  };
+  // provider 'backup' asks Anthropic directly, so the backup can be proved before OpenRouter ever runs dry.
+  if (provider === 'backup' && !backupConfigured()) {
+    return { claude_reachable: false, provider: 'anthropic_backup', provider_fallback: false, backup_configured: false, model_pinned: backupModel(), model_fallback: false, model: null, said: null, ms: 0, error: 'ANTHROPIC_BACKUP_API_KEY is not set on this service, so there is no backup to check.' };
+  }
+  const r = provider === 'backup' ? { ...(await runOnBackup(ask)), provider: 'anthropic_backup' } : await runClaude(ask);
   const said = (r.text || '').trim();
   const ok = r.ok && !r.error && /\bok\b/i.test(said);
   return {
     claude_reachable: ok,
     /** What the run was asked for, and what answered — they differ when the pin is wrong. */
-    model_pinned: model(),
+    model_pinned: r.provider === 'anthropic_backup' ? backupModel() : model(),
     model_fallback: Boolean(r.modelFallback),
+    /** Which provider answered: openrouter, or anthropic_backup after a credit refusal (27 Oct 2026). */
+    provider: r.provider ?? 'openrouter',
+    provider_fallback: Boolean(r.providerFallback),
+    backup_configured: backupConfigured(),
     model: r.model,
     said: said ? said.slice(0, 200) : null,
     ms: r.ms,

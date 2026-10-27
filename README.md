@@ -25,6 +25,35 @@ request ends in a reported outcome. Silence is the one forbidden result.
 
 ---
 
+## After 26 October: an Anthropic backup when OpenRouter runs dry
+
+On 26 Oct OpenRouter's balance ran out and every repair the healer sent here
+ended `Claude Code exited 1: API Error: 402 ... billing_error ... can only afford
+18201`. Bays, North Star, Research Twin and the eval runner already fall back to
+Anthropic when OpenRouter refuses for credit; the bridge had nothing behind it,
+so the healer could diagnose nothing until the balance was topped up
+(LOOP-1793025371486-STVC).
+
+Now a run OpenRouter refuses for credit is re-run **once** on Anthropic directly,
+with `ANTHROPIC_BACKUP_API_KEY`, the OpenRouter token cleared, and the pinned
+model turned into Anthropic's own name (`anthropic/claude-sonnet-4.5` becomes
+`claude-sonnet-4-5`; `ANTHROPIC_BACKUP_MODEL` overrides it). The rules:
+
+- **Never a run that may already have written.** A repair is re-run only when
+  n8n's own call log shows no write landed; a prepare run (MCP, no scripts) only
+  when it produced no output at all. A run that wrote and then hit the credit
+  line is reported as it failed, with `backup_skipped: already_wrote` in the log.
+- **No backup key, no change.** Without `ANTHROPIC_BACKUP_API_KEY` a refusal is
+  reported exactly as before, and the log says why it was not retried.
+- **It is never invisible.** A run the backup took shows its model as
+  `<model> (Anthropic backup: OpenRouter refused for credit)` on the dashboard
+  row and in the Slack report, and `claude.finished` logs `provider`.
+- `GET /health` reports `anthropic_backup` (is the key set), and
+  `GET /health?deep=1&provider=backup` asks Anthropic directly, so the backup is
+  proved before it is ever needed.
+
+---
+
 ## After the 30 September incident (Builder Chasers)
 
 Nine incidents, every repair "not repaired", every fix put back. Two causes in the bridge:
@@ -228,8 +257,8 @@ so an agent's live config is never changed by a machine.
 
 | | |
 |---|---|
-| `GET /health` | `{ ok, busy, running, queued, dry_run, env_missing }`. `running` is 0 or 1 — one repair at a time. Answers before a single secret is set, which is how anybody finds out which ones are still missing |
-| `GET /health?deep=1` | Runs `claude -p "reply with the single word OK"` with no tools and a 60s limit, and returns `{ ok, claude_reachable, model, model_pinned, model_fallback, error }`. **This is the proof that Claude Code reaches OpenRouter on this key**, and it is the thing to run before trusting a repair. `model` is what actually served the request — check it against `model_pinned` |
+| `GET /health` | `{ ok, busy, running, queued, dry_run, env_missing, anthropic_backup }`. `running` is 0 or 1 — one repair at a time. Answers before a single secret is set, which is how anybody finds out which ones are still missing |
+| `GET /health?deep=1` | Runs `claude -p "reply with the single word OK"` with no tools and a 60s limit, and returns `{ ok, claude_reachable, model, model_pinned, model_fallback, error }`. **This is the proof that Claude Code reaches OpenRouter on this key**, and it is the thing to run before trusting a repair. `model` is what actually served the request — check it against `model_pinned`. `provider` says who answered (`openrouter`, or `anthropic_backup` after a credit refusal). Add `&provider=backup` to ask the Anthropic backup directly |
 | `POST /fix-workflow` | One repair request. `x-api-key` must equal `BRIDGE_KEY`, else 401. Answers `202 { accepted: true, repair_id, queue_position }` and does the work afterwards. `queue_position` is 0 when it starts now, higher when it is waiting its turn |
 | `GET /repairs/active` | What is running and what is waiting, in order, and `verifying`: the `repaired_pending` fixes being watched. For when a repair seems stuck |
 
@@ -431,6 +460,8 @@ otherwise. It works whether or not the global install is on `PATH` at runtime.
 | `ANTHROPIC_BASE_URL` | `https://openrouter.ai/api` |
 | `ANTHROPIC_AUTH_TOKEN` | The OpenRouter key Claude Code runs on |
 | `ANTHROPIC_API_KEY` | **Deliberately empty.** Set, Claude Code would use it instead of the auth token. There is no cached Anthropic login in the container and none should be added |
+| `ANTHROPIC_BACKUP_API_KEY` | Optional. An Anthropic API key, used only when OpenRouter refuses a run for credit (27 Oct 2026). Unset, a credit refusal is reported as before |
+| `ANTHROPIC_BACKUP_MODEL`, `ANTHROPIC_BACKUP_BASE_URL` | Optional. The backup's model (defaults to the pin in Anthropic's naming) and host (defaults to `https://api.anthropic.com`) |
 | `DRY_RUN` | Optional, default false |
 | `ANTHROPIC_MODEL` | The model Claude Code runs on. Defaults to **`claude-sonnet-5`** — the CLI's own default resolved to `claude-sonnet-4-20250514` (a Sonnet from May 2025) on this account. Set it on Render to move the pin without a release; if OpenRouter does not know the name, the run falls back to the CLI's default and `/health?deep=1` reports both |
 | `CLAUDE_MODEL` | Optional. Passed as `--model`, and wins over `ANTHROPIC_MODEL` when set |
@@ -447,7 +478,9 @@ ones is reported by name in `/health`'s `env_missing` while it is unset.
 **Model and billing.** Claude Code runs on OpenRouter through
 `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN`, with no proxy. OpenRouter only
 guarantees Claude Code with the Anthropic first-party provider, so no other
-provider is configured here and none should be.
+OpenRouter provider is configured here and none should be. The one exception is
+the Anthropic backup above, which goes to Anthropic directly, not through
+OpenRouter, and only on a credit refusal.
 
 ## The log
 

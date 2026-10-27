@@ -656,10 +656,19 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
         N8N_CALL_LOG: callLog,
       },
       onLog: (detail) => log(repairId, 'claude.note', detail),
+      /**
+       * A credit refusal is re-run on the Anthropic backup only when n8n's own call
+       * log shows no write landed (27 Oct 2026): a second run over a change that
+       * landed could write twice. A prepare run writes through MCP rather than
+       * the scripts, so it is re-run only when it produced no output at all.
+       */
+      canRetry: async (first) => (prepare ? !first.text : !(await readCallLog(callLog)).some((c) => c.method !== 'GET' && c.status >= 200 && c.status < 300)),
     });
-    log(repairId, 'claude.finished', { ok: claudeRun.ok, ms: claudeRun.ms, model: claudeRun.model, timed_out: claudeRun.timedOut, error: claudeRun.error ?? null });
+    log(repairId, 'claude.finished', { ok: claudeRun.ok, ms: claudeRun.ms, provider: claudeRun.provider ?? null, provider_fallback: Boolean(claudeRun.providerFallback), backup_skipped: claudeRun.backupSkipped ?? null, model: claudeRun.model, timed_out: claudeRun.timedOut, error: claudeRun.error ?? null });
 
     const result = claudeRun.ok ? extractResult(claudeRun.text) : null;
+    /** The model as the report shows it: a run the backup took says so, so nobody reads it as OpenRouter's (27 Oct 2026). */
+    const runModel = claudeRun.providerFallback ? `${claudeRun.model ?? 'unknown model'} (Anthropic backup: OpenRouter refused for credit)` : claudeRun.model;
 
     /** What the prepare run left behind, checked by this service rather than taken from the model (30 Sep 2026). */
     let preparedFix = null;
@@ -911,7 +920,7 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
       versionAfter,
       retryExecutionId,
       snapshot,
-      model: claudeRun.model,
+      model: runModel,
       activeBefore,
       activeRestored: restore.restored,
       activeNow: restore.now,
@@ -951,7 +960,7 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
           versionBefore,
           versionAfter,
           snapshot,
-          model: claudeRun.model,
+          model: runModel,
           activeBefore,
           activeRestored: restore.restored,
           activeNow: restore.now,

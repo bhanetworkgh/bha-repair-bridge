@@ -5,6 +5,7 @@
  *
  *   GET  /health            what is set, what is running, and whether writes are on
  *   GET  /health?deep=1     the proof that Claude Code reaches OpenRouter on this key
+ *   GET  /health?deep=1&provider=backup   the same proof against the Anthropic backup (27 Oct 2026)
  *   POST /fix-workflow      one repair request from n8n's "BHA — Self Healer"
  *
  * `/health` answers before any secret exists — that is how somebody finds out
@@ -20,7 +21,7 @@ import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { deepHealthTimeoutMs, dryRun, env, envMissing, port } from './config.js';
-import { reachable } from './claude.js';
+import { backupConfigured, reachable } from './claude.js';
 import { errText, log, logError } from './log.js';
 import { accept, activeRepairs, busy, queued, recover, RequestError, running } from './repair.js';
 import * as prepared from './prepared.js';
@@ -54,6 +55,8 @@ export function createApp() {
       env_missing: envMissing(),
       /** Whether prepared fixes (drafts for protected workflows and agents) can be made (30 Sep 2026). */
       n8n_mcp: mcp.configured(),
+      /** Whether the Anthropic backup is set, for when OpenRouter refuses for credit (27 Oct 2026). */
+      anthropic_backup: backupConfigured(),
     };
 
     const deep = req.query.deep === '1' || req.query.deep === 'true';
@@ -65,8 +68,9 @@ export function createApp() {
      * this service can be right while the model is unreachable.
      */
     try {
-      const r = await reachable(deepHealthTimeoutMs());
-      log(null, 'health.deep', { claude_reachable: r.claude_reachable, model: r.model, model_pinned: r.model_pinned, model_fallback: r.model_fallback, ms: r.ms, error: r.error });
+      const provider = req.query.provider === 'backup' ? 'backup' : null;
+      const r = await reachable(deepHealthTimeoutMs(), { provider });
+      log(null, 'health.deep', { claude_reachable: r.claude_reachable, provider: r.provider, provider_fallback: r.provider_fallback, model: r.model, model_pinned: r.model_pinned, model_fallback: r.model_fallback, ms: r.ms, error: r.error });
       return res.json({
         ...base,
         ok: r.claude_reachable,
@@ -74,6 +78,9 @@ export function createApp() {
         model: r.model,
         model_pinned: r.model_pinned,
         model_fallback: r.model_fallback,
+        provider: r.provider,
+        provider_fallback: r.provider_fallback,
+        backup_configured: r.backup_configured,
         said: r.said,
         checked_in_ms: r.ms,
         error: r.error,
