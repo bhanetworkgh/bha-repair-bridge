@@ -462,6 +462,7 @@ otherwise. It works whether or not the global install is on `PATH` at runtime.
 | `ANTHROPIC_API_KEY` | **Deliberately empty.** Set, Claude Code would use it instead of the auth token. There is no cached Anthropic login in the container and none should be added |
 | `ANTHROPIC_BACKUP_API_KEY` | Optional. An Anthropic API key, used only when OpenRouter refuses a run for credit (27 Oct 2026). Unset, a credit refusal is reported as before |
 | `ANTHROPIC_BACKUP_MODEL`, `ANTHROPIC_BACKUP_BASE_URL` | Optional. The backup's model (defaults to the pin in Anthropic's naming) and host (defaults to `https://api.anthropic.com`) |
+| `CLAUDE_BACKUP_BIN` | Optional. The CLI the backup runs. Defaults to `claude` on PATH, the latest one the build installs globally, because the package's own pinned copy (1.0.128) is refused by Anthropic as too old for the model. OpenRouter accepts the pinned copy, so the primary keeps it |
 | `DRY_RUN` | Optional, default false |
 | `ANTHROPIC_MODEL` | The model Claude Code runs on. Defaults to **`claude-sonnet-5`** — the CLI's own default resolved to `claude-sonnet-4-20250514` (a Sonnet from May 2025) on this account. Set it on Render to move the pin without a release; if OpenRouter does not know the name, the run falls back to the CLI's default and `/health?deep=1` reports both |
 | `CLAUDE_MODEL` | Optional. Passed as `--model`, and wins over `ANTHROPIC_MODEL` when set |

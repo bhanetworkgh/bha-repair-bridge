@@ -58,6 +58,7 @@ function setEnv({ backup = 'sk-ant-backup-test' } = {}) {
 
 const run = (bin, extra = {}) => {
   process.env.CLAUDE_BIN = bin;
+  process.env.CLAUDE_BACKUP_BIN = bin;
   return runClaude({ prompt: 'say OK', cwd: tmpdir(), timeoutMs: 20_000, ...extra });
 };
 
@@ -143,6 +144,7 @@ test('the deep check can be pointed at the backup directly, and says so when the
   setEnv();
   const fake = await dryOpenRouter();
   process.env.CLAUDE_BIN = fake.bin;
+  process.env.CLAUDE_BACKUP_BIN = fake.bin;
   const r = await reachable(20_000, { provider: 'backup' });
   assert.equal(r.claude_reachable, true);
   assert.equal(r.provider, 'anthropic_backup');
@@ -166,4 +168,14 @@ test('a healthy OpenRouter run is untouched and says which provider answered', a
   assert.equal(r.ok, true);
   assert.equal(r.provider, 'openrouter');
   assert.equal(r.providerFallback, undefined);
+});
+
+test('the backup runs its own CLI: the pinned copy is too old for Anthropic', async () => {
+  const { backupBin } = await import('../src/claude.js');
+  const saved = process.env.CLAUDE_BACKUP_BIN;
+  delete process.env.CLAUDE_BACKUP_BIN;
+  assert.equal(backupBin(), 'claude');
+  process.env.CLAUDE_BACKUP_BIN = '/x/claude';
+  assert.equal(backupBin(), '/x/claude');
+  if (saved === undefined) delete process.env.CLAUDE_BACKUP_BIN; else process.env.CLAUDE_BACKUP_BIN = saved;
 });

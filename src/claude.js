@@ -43,6 +43,17 @@ export function claudeBin() {
   return existsSync(local) ? local : 'claude';
 }
 
+/**
+ * The CLI the Anthropic backup runs (27 Oct 2026). The package's own copy is pinned by the lockfile at
+ * 1.0.128, which OpenRouter accepts and Anthropic refuses ("Claude Code 1.0.128 does not support this
+ * model; version 2.1.280 or newer is required"). The build also installs the latest CLI globally
+ * (`npm install -g @anthropic-ai/claude-code`), so the backup runs that one from PATH, or CLAUDE_BACKUP_BIN.
+ * The primary keeps its pinned copy, which is what every repair so far has been proven on.
+ */
+export function backupBin() {
+  return env('CLAUDE_BACKUP_BIN') || 'claude';
+}
+
 /** The environment the child gets, and nothing beyond it. */
 function childEnv(extra = {}) {
   const base = {
@@ -127,7 +138,7 @@ function backupEnv() {
 
 /** One run on the backup, with the caller's own environment kept (the n8n scripts need it). */
 export function runOnBackup(options) {
-  return spawnClaude({ ...options, extraEnv: { ...(options.extraEnv ?? {}), ...backupEnv() }, modelOverride: backupModel(), modelArg: env('CLAUDE_MODEL') ? backupModel() : null });
+  return spawnClaude({ ...options, extraEnv: { ...(options.extraEnv ?? {}), ...backupEnv() }, modelOverride: backupModel(), modelArg: env('CLAUDE_MODEL') ? backupModel() : null, bin: backupBin() });
 }
 
 /**
@@ -196,8 +207,8 @@ export async function runClaude(options) {
   return { ...first, provider: 'openrouter' };
 }
 
-function spawnClaude({ prompt, cwd, timeoutMs, tools = null, permissionMode = null, modelOverride = null, modelArg = undefined, extraEnv = {}, extraArgs = [], onLog = () => {} }) {
-  const bin = claudeBin();
+function spawnClaude({ prompt, cwd, timeoutMs, tools = null, permissionMode = null, modelOverride = null, modelArg = undefined, extraEnv = {}, extraArgs = [], onLog = () => {}, bin: binArg = null }) {
+  const bin = binArg || claudeBin();
   const args = ['-p', '--output-format', 'json'];
 
   // The backup names its own model: CLAUDE_MODEL is an OpenRouter name and Anthropic would refuse it.
