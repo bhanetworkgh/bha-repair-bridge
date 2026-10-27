@@ -50,8 +50,16 @@ export function claudeBin() {
  * (`npm install -g @anthropic-ai/claude-code`), so the backup runs that one from PATH, or CLAUDE_BACKUP_BIN.
  * The primary keeps its pinned copy, which is what every repair so far has been proven on.
  */
-export function backupBin() {
-  return env('CLAUDE_BACKUP_BIN') || 'claude';
+export function backupBin(pathVar = process.env.PATH ?? '') {
+  const override = env('CLAUDE_BACKUP_BIN');
+  if (override) return override;
+  // `npm start` puts every node_modules/.bin first on PATH, so a bare 'claude' is the pinned copy again.
+  for (const dir of pathVar.split(':')) {
+    if (!dir || /node_modules[\\/]\.bin\/?$/.test(dir)) continue;
+    const candidate = `${dir.replace(/\/$/, '')}/claude`;
+    if (existsSync(candidate)) return candidate;
+  }
+  return 'claude';
 }
 
 /** The environment the child gets, and nothing beyond it. */

@@ -174,8 +174,21 @@ test('the backup runs its own CLI: the pinned copy is too old for Anthropic', as
   const { backupBin } = await import('../src/claude.js');
   const saved = process.env.CLAUDE_BACKUP_BIN;
   delete process.env.CLAUDE_BACKUP_BIN;
-  assert.equal(backupBin(), 'claude');
+  assert.equal(backupBin(''), 'claude');
   process.env.CLAUDE_BACKUP_BIN = '/x/claude';
   assert.equal(backupBin(), '/x/claude');
   if (saved === undefined) delete process.env.CLAUDE_BACKUP_BIN; else process.env.CLAUDE_BACKUP_BIN = saved;
+});
+
+test('the backup skips node_modules/.bin on PATH, where npm start puts the pinned copy', async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { backupBin } = await import('../src/claude.js');
+  const root = mkdtempSync(join(tmpdir(), 'bin-'));
+  const local = join(root, 'app', 'node_modules', '.bin'); mkdirSync(local, { recursive: true }); writeFileSync(join(local, 'claude'), '');
+  const global = join(root, 'global', 'bin'); mkdirSync(global, { recursive: true }); writeFileSync(join(global, 'claude'), '');
+  const saved = process.env.CLAUDE_BACKUP_BIN; delete process.env.CLAUDE_BACKUP_BIN;
+  assert.equal(backupBin(`${local}:${global}:/usr/bin`), join(global, 'claude'));
+  if (saved !== undefined) process.env.CLAUDE_BACKUP_BIN = saved;
 });
