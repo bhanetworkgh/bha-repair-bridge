@@ -37,7 +37,9 @@ export function env(name) {
 
 /** The required variables that are not set, by name. Empty is the healthy answer. */
 export function envMissing() {
-  return REQUIRED_ENV.filter((name) => !env(name));
+  const missing = REQUIRED_ENV.filter((name) => !env(name));
+  if (env('BHA_PRIMARY_PROVIDER') !== 'openrouter' && !env('ANTHROPIC_API_KEY') && !env('ANTHROPIC_BACKUP_API_KEY')) missing.push('ANTHROPIC_API_KEY or ANTHROPIC_BACKUP_API_KEY');
+  return missing;
 }
 
 export function port() {

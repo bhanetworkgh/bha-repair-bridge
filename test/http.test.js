@@ -1,3 +1,4 @@
+process.env.BHA_PRIMARY_PROVIDER = 'openrouter'; // Legacy regression fixtures explicitly select their original route.
 /**
  * The HTTP surface on its own: what answers before any secret exists, what the
  * key does, and what a malformed request gets told.

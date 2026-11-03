@@ -668,7 +668,7 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
 
     const result = claudeRun.ok ? extractResult(claudeRun.text) : null;
     /** The model as the report shows it: a run the backup took says so, so nobody reads it as OpenRouter's (27 Oct 2026). */
-    const runModel = claudeRun.providerFallback ? `${claudeRun.model ?? 'unknown model'} (Anthropic backup: OpenRouter refused for credit)` : claudeRun.model;
+    const runModel = claudeRun.providerFallback ? `${claudeRun.model ?? 'unknown model'} (provider fallback: primary refused)` : claudeRun.model;
 
     /** What the prepare run left behind, checked by this service rather than taken from the model (30 Sep 2026). */
     let preparedFix = null;

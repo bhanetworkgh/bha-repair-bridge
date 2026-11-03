@@ -1,3 +1,4 @@
+process.env.BHA_PRIMARY_PROVIDER = 'openrouter'; // Legacy regression fixtures explicitly select their original route.
 /**
  * The 26 September Post Loop Digest case, end to end.
  *

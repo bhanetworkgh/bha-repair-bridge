@@ -1,3 +1,4 @@
+process.env.BHA_PRIMARY_PROVIDER = 'openrouter'; // Legacy regression fixtures explicitly select their original route.
 /**
  * The queue on its own: one at a time, in order, and nothing lost when a job
  * throws.

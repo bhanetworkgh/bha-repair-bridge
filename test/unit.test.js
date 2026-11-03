@@ -1,3 +1,4 @@
+process.env.BHA_PRIMARY_PROVIDER = 'openrouter'; // Legacy regression fixtures explicitly select their original route.
 /**
  * The decisions that must not drift: what is refused, what counts as a repair,
  * and how a result is read out of whatever Claude Code printed.

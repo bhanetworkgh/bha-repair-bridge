@@ -514,3 +514,21 @@ the body it could not deliver.
 | `src/scripts.js` | The two n8n helper scripts, their call log, and what a refused write means |
 | `src/report.js` | Both reports, with retries, and the loud log when one will not send |
 | `src/config.js` | Every environment variable, read through functions so `/health` is current |
+
+## Provider routing, 3 November 2026
+
+Native Anthropic is the default primary. It uses `ANTHROPIC_API_KEY`, or the existing
+`ANTHROPIC_BACKUP_API_KEY` as a compatibility alias for the funded company key. The
+latest globally installed Claude CLI serves native Anthropic; one-hour prompt caching
+is enabled. The existing `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` remain the
+OpenRouter fallback configuration. Never put the native key in the OpenRouter token.
+`BHA_PRIMARY_PROVIDER=openrouter` restores the old route for rollback.
+
+`GET /health?deep=1` checks the primary; `&provider=backup` checks OpenRouter directly.
+A retryable primary refusal can fall back only if the caller confirms no writes, or
+the tool-less request is safe to repeat. No repair that may have written is replayed.
+
+Validation: all 19 provider/model tests pass, including native key isolation, fallback
+key isolation and no-double-write guard. The full suite has two existing failures:
+agent-called reach-node wording and prepared-fix reach_nodes expectation. Both reproduce
+unchanged at baseline 8bbf1e1; they are not provider regressions.

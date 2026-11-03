@@ -1,3 +1,4 @@
+process.env.BHA_PRIMARY_PROVIDER = 'openrouter'; // Legacy regression fixtures explicitly select their original route.
 /** What a retry can prove, and which failures are alarms rather than faults (30 Sep 2026). */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';

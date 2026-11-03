@@ -1,3 +1,4 @@
+process.env.BHA_PRIMARY_PROVIDER = 'openrouter'; // Legacy regression fixtures explicitly select their original route.
 /** What the model is shown beyond the failed node (30 Sep 2026). */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';

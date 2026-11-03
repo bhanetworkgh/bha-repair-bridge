@@ -1,3 +1,4 @@
+process.env.BHA_PRIMARY_PROVIDER = 'openrouter'; // Legacy regression fixtures explicitly select their original route.
 /**
  * The Anthropic backup (27 Oct 2026, LOOP-1793025371486-STVC).
  *

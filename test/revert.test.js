@@ -1,3 +1,4 @@
+process.env.BHA_PRIMARY_PROVIDER = 'openrouter'; // Legacy regression fixtures explicitly select their original route.
 /**
  * The automatic revert and the protected workflows (28 Sep 2026, Agent Upgrade
  * Plan step 4.4), end to end against stubs.

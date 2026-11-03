@@ -21,7 +21,7 @@ import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { deepHealthTimeoutMs, dryRun, env, envMissing, port } from './config.js';
-import { backupConfigured, reachable } from './claude.js';
+import { backupConfigured, primaryProvider, reachable } from './claude.js';
 import { errText, log, logError } from './log.js';
 import { accept, activeRepairs, busy, queued, recover, RequestError, running } from './repair.js';
 import * as prepared from './prepared.js';
@@ -56,7 +56,8 @@ export function createApp() {
       /** Whether prepared fixes (drafts for protected workflows and agents) can be made (30 Sep 2026). */
       n8n_mcp: mcp.configured(),
       /** Whether the Anthropic backup is set, for when OpenRouter refuses for credit (27 Oct 2026). */
-      anthropic_backup: backupConfigured(),
+      primary_provider: primaryProvider(),
+      fallback_configured: backupConfigured(),
     };
 
     const deep = req.query.deep === '1' || req.query.deep === 'true';

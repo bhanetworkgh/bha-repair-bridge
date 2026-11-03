@@ -1,3 +1,4 @@
+process.env.BHA_PRIMARY_PROVIDER = 'openrouter'; // Legacy regression fixtures explicitly select their original route.
 /** The second identical diagnosis without a repair hands over a patch (30 Sep 2026). */
 import assert from 'node:assert/strict';
 import { mkdtemp } from 'node:fs/promises';
