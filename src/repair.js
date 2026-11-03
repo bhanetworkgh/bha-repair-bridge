@@ -750,7 +750,9 @@ async function run({ request, repairId, workflowId, executionId, workflowName, s
     const looksChanged = wrote || Boolean(claimed && (claimed === 'repaired' || strings(result?.nodes_changed).length > 0));
 
     if (isDryRun) {
-      log(repairId, 'dry_run.no_writes', 'DRY_RUN is on: nothing was written to n8n and no retry was run.');
+      log(repairId, 'dry_run.no_writes', dryRun()
+        ? 'DRY_RUN is on: nothing was written to n8n and no retry was run.'
+        : 'Diagnosis only for this protected workflow: nothing was written to n8n and no retry was run.');
     } else if (looksChanged) {
       const after = await n8n.workflow(workflowId);
       afterWf = after;
