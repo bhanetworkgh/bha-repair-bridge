@@ -128,7 +128,7 @@ test('with no backup key the refusal is reported as before, and why it was not r
   assert.match(r.error, /402/);
   assert.equal(r.backupSkipped, 'not_configured');
   assert.equal((await fake.runs()).length, 1);
-  assert.match(notes.join(' '), /ANTHROPIC_BACKUP_API_KEY/);
+  assert.match(notes.join(' '), /ANTHROPIC_API_KEY/);
 });
 
 test('an OpenRouter-style pin is turned into Anthropic’s own model name for the backup', () => {
@@ -156,7 +156,7 @@ test('the deep check can be pointed at the backup directly, and says so when the
   const none = await reachable(20_000, { provider: 'backup' });
   assert.equal(none.claude_reachable, false);
   assert.equal(none.backup_configured, false);
-  assert.match(none.error, /ANTHROPIC_BACKUP_API_KEY/);
+  assert.match(none.error, /ANTHROPIC_API_KEY/);
 });
 
 test('a healthy OpenRouter run is untouched and says which provider answered', async () => {

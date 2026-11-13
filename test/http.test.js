@@ -13,7 +13,7 @@ let base;
 let server;
 
 before(async () => {
-  for (const name of ['BRIDGE_KEY', 'N8N_BASE_URL', 'N8N_API_KEY', 'DASHBOARD_URL', 'DASHBOARD_INBOUND_KEY', 'REPORT_WEBHOOK_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL']) {
+  for (const name of ['BRIDGE_KEY', 'N8N_BASE_URL', 'N8N_API_KEY', 'DASHBOARD_URL', 'DASHBOARD_INBOUND_KEY', 'REPORT_WEBHOOK_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BACKUP_API_KEY', 'BHA_PRIMARY_PROVIDER']) {
     delete process.env[name];
   }
   const { createApp } = await import('../src/server.js');
@@ -42,7 +42,7 @@ test('/health answers before a single secret is set, and names the ones that are
   assert.equal(r.body.running, 0);
   assert.equal(r.body.queued, 0);
   assert.equal(r.body.dry_run, false);
-  assert.deepEqual(r.body.env_missing, ['BRIDGE_KEY', 'N8N_BASE_URL', 'N8N_API_KEY', 'DASHBOARD_URL', 'DASHBOARD_INBOUND_KEY', 'REPORT_WEBHOOK_URL', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN']);
+  assert.deepEqual(r.body.env_missing, ['BRIDGE_KEY', 'N8N_BASE_URL', 'N8N_API_KEY', 'DASHBOARD_URL', 'DASHBOARD_INBOUND_KEY', 'REPORT_WEBHOOK_URL', 'ANTHROPIC_API_KEY']);
 });
 
 test('without BRIDGE_KEY nothing is accepted, and the answer says why', async () => {

@@ -15,10 +15,10 @@ const trim = (v) => (typeof v === 'string' ? v.trim() : '');
 /**
  * The variables without which a repair cannot run end to end.
  *
- * `ANTHROPIC_API_KEY` is deliberately not here: it is set to the empty string on
- * purpose so Claude Code uses `ANTHROPIC_AUTH_TOKEN` against OpenRouter instead.
- * `SLACK_REPORT_CHANNEL` is not here either — it is only a fallback for a
- * request that did not name its own `report_channel`.
+ * The model keys are not in this list: which one is required depends on the
+ * primary provider, so `envMissing` adds it below. `SLACK_REPORT_CHANNEL` is not
+ * here either — it is only a fallback for a request that did not name its own
+ * `report_channel`.
  */
 export const REQUIRED_ENV = [
   'BRIDGE_KEY',
@@ -27,18 +27,45 @@ export const REQUIRED_ENV = [
   'DASHBOARD_URL',
   'DASHBOARD_INBOUND_KEY',
   'REPORT_WEBHOOK_URL',
-  'ANTHROPIC_BASE_URL',
-  'ANTHROPIC_AUTH_TOKEN',
 ];
 
 export function env(name) {
   return trim(process.env[name]) || null;
 }
 
+/**
+ * The two providers' settings, under names that say what they are (13 Nov 2026).
+ *
+ * Render holds `ANTHROPIC_API_KEY` (an Anthropic key), `OPENROUTER_API_KEY` and
+ * `OPENROUTER_BASE_URL`. Claude Code itself only understands `ANTHROPIC_*`
+ * names, so `claude.js` hands these to the CLI under those names on each route;
+ * nothing on the service has to carry an OpenRouter value under an Anthropic
+ * name. The old names (`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
+ * `ANTHROPIC_BACKUP_API_KEY`) are still read as fallbacks, so a service that has
+ * not been renamed keeps working.
+ */
+export function anthropicKey() {
+  return env('ANTHROPIC_API_KEY') || env('ANTHROPIC_BACKUP_API_KEY');
+}
+
+export function openRouterKey() {
+  return env('OPENROUTER_API_KEY') || env('ANTHROPIC_AUTH_TOKEN');
+}
+
+/** Claude Code appends /v1/messages itself, so a trailing /v1 is taken off. */
+export function openRouterBaseUrl() {
+  const set = env('OPENROUTER_BASE_URL') || env('ANTHROPIC_BASE_URL') || 'https://openrouter.ai/api';
+  return set.replace(/\/+$/, '').replace(/\/v1$/, '');
+}
+
 /** The required variables that are not set, by name. Empty is the healthy answer. */
 export function envMissing() {
   const missing = REQUIRED_ENV.filter((name) => !env(name));
-  if (env('BHA_PRIMARY_PROVIDER') !== 'openrouter' && !env('ANTHROPIC_API_KEY') && !env('ANTHROPIC_BACKUP_API_KEY')) missing.push('ANTHROPIC_API_KEY or ANTHROPIC_BACKUP_API_KEY');
+  if (env('BHA_PRIMARY_PROVIDER') === 'openrouter') {
+    if (!openRouterKey()) missing.push('OPENROUTER_API_KEY');
+  } else if (!anthropicKey()) {
+    missing.push('ANTHROPIC_API_KEY');
+  }
   return missing;
 }
 

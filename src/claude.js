@@ -18,7 +18,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { claudeModel, env } from './config.js';
+import { anthropicKey, claudeModel, env, openRouterBaseUrl, openRouterKey } from './config.js';
 
 /**
  * The model a run asks OpenRouter for.
@@ -68,11 +68,14 @@ function childEnv(extra = {}) {
     PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
     HOME: process.env.HOME ?? '/tmp',
     LANG: process.env.LANG ?? 'C.UTF-8',
-    // OpenRouter, through Claude Code's own Anthropic-compatible settings. No
-    // proxy, and no cached first-party login in the container.
-    ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL ?? '',
-    ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN ?? '',
-    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? '',
+    // OpenRouter, through Claude Code's own Anthropic-compatible settings: the
+    // CLI only reads ANTHROPIC_* names, so OPENROUTER_API_KEY and
+    // OPENROUTER_BASE_URL are handed to it under those (13 Nov 2026). The
+    // Anthropic key is withheld here, because set, the CLI would use it instead
+    // of the OpenRouter token; the Anthropic route sets it itself (backupEnv).
+    ANTHROPIC_BASE_URL: openRouterBaseUrl(),
+    ANTHROPIC_AUTH_TOKEN: openRouterKey() || '',
+    ANTHROPIC_API_KEY: '',
     ANTHROPIC_MODEL: model(),
     // Keep the CLI quiet and non-interactive.
     CI: '1',
@@ -120,7 +123,7 @@ export const CREDIT_REFUSAL = /(\b402\b|billing_error|payment required|can only 
 
 /** Whether the Anthropic backup is set on this service. Without it a credit refusal is reported as before. */
 export function backupConfigured() {
-  return primaryProvider() === 'anthropic' ? Boolean(env('ANTHROPIC_AUTH_TOKEN') && env('ANTHROPIC_BASE_URL')) : Boolean(env('ANTHROPIC_BACKUP_API_KEY'));
+  return primaryProvider() === 'anthropic' ? Boolean(openRouterKey()) : Boolean(anthropicKey());
 }
 
 /**
@@ -140,7 +143,7 @@ function backupEnv() {
   return {
     ANTHROPIC_BASE_URL: env('ANTHROPIC_BACKUP_BASE_URL') || 'https://api.anthropic.com',
     ANTHROPIC_AUTH_TOKEN: '',
-    ANTHROPIC_API_KEY: env('ANTHROPIC_API_KEY') || env('ANTHROPIC_BACKUP_API_KEY') || '',
+    ANTHROPIC_API_KEY: anthropicKey() || '',
     ENABLE_PROMPT_CACHING_1H: '1',
   };
 }
@@ -200,7 +203,7 @@ async function runLegacyClaude(options) {
   const refusal = `${first.error ?? ''} ${first.stderr ?? ''} ${first.text ?? ''}`;
   if ((!first.ok || first.error) && CREDIT_REFUSAL.test(refusal)) {
     if (!backupConfigured()) {
-      options.onLog?.('OpenRouter refused for credit and no Anthropic backup is set on this service (ANTHROPIC_BACKUP_API_KEY), so the run is reported as it failed');
+      options.onLog?.('OpenRouter refused for credit and no Anthropic backup is set on this service (ANTHROPIC_API_KEY), so the run is reported as it failed');
       return { ...first, provider: 'openrouter', backupSkipped: 'not_configured' };
     }
     const safe = !options.tools ? true : options.canRetry ? await options.canRetry(first) : !first.text;
@@ -235,7 +238,7 @@ export async function runClaude(options) {
   const safe = !options.tools ? true : options.canRetry ? await options.canRetry(first) : !first.text;
   if (!safe) return { ...first, provider: 'anthropic', backupSkipped: 'already_wrote' };
   options.onLog?.('Anthropic refused; retrying once on OpenRouter after confirming the first run is safe to retry');
-  const second = await spawnClaude({ ...options, extraEnv: { ...(options.extraEnv ?? {}), ANTHROPIC_API_KEY: '', ANTHROPIC_BASE_URL: env('ANTHROPIC_BASE_URL') || 'https://openrouter.ai/api', ANTHROPIC_AUTH_TOKEN: env('ANTHROPIC_AUTH_TOKEN') || '' } });
+  const second = await spawnClaude({ ...options, extraEnv: { ...(options.extraEnv ?? {}), ANTHROPIC_API_KEY: '', ANTHROPIC_BASE_URL: openRouterBaseUrl(), ANTHROPIC_AUTH_TOKEN: openRouterKey() || '' } });
   return { ...second, provider: 'openrouter', providerFallback: true, primaryError: String(first.error || '').slice(0, 600), ms: first.ms + second.ms };
 }
 
@@ -374,7 +377,7 @@ export async function reachable(timeoutMs, { provider = null } = {}) {
   };
   // provider 'backup' asks Anthropic directly, so the backup can be proved before OpenRouter ever runs dry.
   if (provider === 'backup' && !backupConfigured()) {
-    return { claude_reachable: false, provider: 'anthropic_backup', provider_fallback: false, backup_configured: false, model_pinned: backupModel(), model_fallback: false, model: null, said: null, ms: 0, error: 'ANTHROPIC_BACKUP_API_KEY is not set on this service, so there is no backup to check.' };
+    return { claude_reachable: false, provider: 'anthropic_backup', provider_fallback: false, backup_configured: false, model_pinned: backupModel(), model_fallback: false, model: null, said: null, ms: 0, error: primaryProvider() === 'anthropic' ? 'OPENROUTER_API_KEY is not set on this service, so there is no OpenRouter backup to check.' : 'ANTHROPIC_API_KEY is not set on this service, so there is no Anthropic backup to check.' };
   }
   const r = provider === 'backup' ? primaryProvider() === 'anthropic' ? { ...(await spawnClaude({ ...ask, extraEnv: { ANTHROPIC_API_KEY: '' } })), provider: 'openrouter' } : { ...(await runOnBackup(ask)), provider: 'anthropic_backup' } : await runClaude(ask);
   const said = (r.text || '').trim();

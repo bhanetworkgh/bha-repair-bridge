@@ -457,10 +457,10 @@ otherwise. It works whether or not the global install is on `PATH` at runtime.
 | `DASHBOARD_INBOUND_KEY` | The dashboard's inbound key, sent as `x-dashboard-key` |
 | `REPORT_WEBHOOK_URL` | The n8n webhook that posts to Slack and closes the incident |
 | `SLACK_REPORT_CHANNEL` | Where a report goes when the request did not name a `report_channel` |
-| `ANTHROPIC_BASE_URL` | `https://openrouter.ai/api` |
-| `ANTHROPIC_AUTH_TOKEN` | The OpenRouter key Claude Code runs on |
-| `ANTHROPIC_API_KEY` | **Deliberately empty.** Set, Claude Code would use it instead of the auth token. There is no cached Anthropic login in the container and none should be added |
-| `ANTHROPIC_BACKUP_API_KEY` | Optional. An Anthropic API key, used only when OpenRouter refuses a run for credit (27 Oct 2026). Unset, a credit refusal is reported as before |
+| `ANTHROPIC_API_KEY` | The Anthropic key the primary route runs on. Never handed to the OpenRouter route: set there, Claude Code would use it instead of the OpenRouter token (13 Nov 2026) |
+| `OPENROUTER_API_KEY` | The OpenRouter key the fallback route runs on. The bridge hands it to Claude Code as `ANTHROPIC_AUTH_TOKEN`, the only name the CLI reads |
+| `OPENROUTER_BASE_URL` | Optional, default `https://openrouter.ai/api`; a trailing `/v1` is taken off. Handed to Claude Code as `ANTHROPIC_BASE_URL` |
+| `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_BACKUP_API_KEY` | The old names, still read as fallbacks for the three above so an unrenamed service keeps working. New settings use the names above |
 | `ANTHROPIC_BACKUP_MODEL`, `ANTHROPIC_BACKUP_BASE_URL` | Optional. The backup's model (defaults to the pin in Anthropic's naming) and host (defaults to `https://api.anthropic.com`) |
 | `CLAUDE_BACKUP_BIN` | Optional. The CLI the backup runs. Defaults to `claude` on PATH, the latest one the build installs globally, because the package's own pinned copy (1.0.128) is refused by Anthropic as too old for the model. OpenRouter accepts the pinned copy, so the primary keeps it |
 | `DRY_RUN` | Optional, default false |
@@ -514,6 +514,15 @@ the body it could not deliver.
 | `src/scripts.js` | The two n8n helper scripts, their call log, and what a refused write means |
 | `src/report.js` | Both reports, with retries, and the loud log when one will not send |
 | `src/config.js` | Every environment variable, read through functions so `/health` is current |
+
+## Provider settings named for what they are, 13 November 2026
+
+Render holds `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY` and `OPENROUTER_BASE_URL`,
+one key per service so each service's spend shows on its own key. Claude Code only
+understands `ANTHROPIC_*` names, so `src/claude.js` hands the OpenRouter values to it
+as `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` on the OpenRouter route only, with
+`ANTHROPIC_API_KEY` cleared there. The section below predates this and names the old
+settings, which are still read as fallbacks. `test/provider-names.test.js` pins it.
 
 ## Provider routing, 3 November 2026
 
