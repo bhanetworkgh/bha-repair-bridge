@@ -137,3 +137,13 @@ export function verifyPollMs() {
 export function verifyWindowMs() {
   return Number(process.env.VERIFY_WINDOW_MS) || 24 * 60 * 60 * 1000;
 }
+
+/**
+ * How long a quiet watch keeps going (17 Nov 2026, Genie rebuild 9.3). A day with no real run used to end as
+ * needs_human: a person was asked to look at a fix nothing had yet had the chance to prove. Now a window in
+ * which nothing reached the fix and nothing failed is extended, a window at a time, for up to seven days from
+ * the publish; only then is a person asked. A failure, or n8n that cannot be read, still settles at once.
+ */
+export function verifyMaxMs() {
+  return Number(process.env.VERIFY_MAX_MS) || 7 * 24 * 60 * 60 * 1000;
+}

@@ -40,7 +40,7 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { dryRun, env, repairTimeoutMs, retryWaitMs, verifyPollMs, verifyWindowMs } from './config.js';
+import { dryRun, env, repairTimeoutMs, retryWaitMs, verifyMaxMs, verifyPollMs, verifyWindowMs } from './config.js';
 import { runClaude } from './claude.js';
 import { errText, log, logError } from './log.js';
 import * as n8n from './n8n.js';
@@ -1152,13 +1152,25 @@ export function watchForProof(watch, { pollMs = verifyPollMs() } = {}) {
   if (watching.has(watch.repair_id)) return;
   const entry = { ...watch, timer: null };
   watching.set(watch.repair_id, entry);
-  const deadline = Date.parse(watch.until);
+  let deadline = Date.parse(watch.until);
   log(watch.repair_id, 'verify.watching', { since: new Date(watch.since_ms).toISOString(), until: watch.until, every_ms: pollMs });
 
   const tick = async () => {
     const later = await laterRunsOrNothing({ repairId: watch.repair_id, workflowId: watch.workflow_id, sinceMs: watch.since_ms, signature: watch.signature, executionId: watch.execution_id, reachNodes: watch.reach_nodes ?? [] });
     const settled = later.passed.length > 0 || Boolean(later.failedSame);
-    const over = Date.now() >= deadline;
+    let over = Date.now() >= deadline;
+    // 17 Nov 2026 (rebuild 9.3): a quiet window is not a reason to call a person. Nothing reached the fix and
+    // nothing failed, so the watch goes on, a window at a time, up to VERIFY_MAX_MS from the publish.
+    const quiet = !settled && !later.unread && !(later.otherFailures?.length);
+    const cap = watch.since_ms + verifyMaxMs();
+    if (over && quiet && deadline < cap) {
+      deadline = Math.min(cap, deadline + verifyWindowMs());
+      watch.until = new Date(deadline).toISOString();
+      entry.until = watch.until;
+      await state.markPending({ ...watch }).catch((e) => logError(watch.repair_id, 'verify.extend.persist_failed', errText(e)));
+      log(watch.repair_id, 'verify.extended', { until: watch.until, cap: new Date(cap).toISOString(), not_reached: (later.notReached ?? []).length });
+      over = false;
+    }
     log(watch.repair_id, 'verify.check', { passed: later.passed.map((r) => r.execution_id), not_reached: (later.notReached ?? []).map((r) => r.execution_id), failed_same: later.failedSame?.execution_id ?? null, over });
 
     if (!settled && !over) {

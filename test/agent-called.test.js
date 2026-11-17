@@ -183,7 +183,7 @@ async function fakeClaude() {
   return bin;
 }
 
-async function runCase({ failedId, recovery = true, afterPublish, windowMs = 20_000, request = {} }) {
+async function runCase({ failedId, recovery = true, afterPublish, windowMs = 20_000, maxMs = windowMs, request = {} }) {
   const n8n = stubN8n({ failedId, recovery, afterPublish });
   const dashboard = collector();
   const webhook = collector();
@@ -202,6 +202,7 @@ async function runCase({ failedId, recovery = true, afterPublish, windowMs = 20_
     REPAIR_TIMEOUT_MS: '20000',
     VERIFY_POLL_MS: '300',
     VERIFY_WINDOW_MS: String(windowMs),
+    VERIFY_MAX_MS: String(maxMs),
     STATE_DIR: await mkdtemp(path.join(tmpdir(), 'repair-state-')),
   });
 
@@ -450,5 +451,26 @@ test('a pending verification survives a restart: boot resumes the watch and the 
     assert.deepEqual(await state.pendingWatches(), [], 'the record is cleared once it has reported');
   } finally {
     for (const s of [n8n.server, dashboard.server, webhook.server]) await new Promise((r) => s.close(r));
+  }
+});
+
+// 17 Nov 2026 (Genie rebuild 9.3): a quiet first window is extended rather than handed to a person.
+test('a window with no real run is extended, and a run in the next window proves the fix with no person asked', async () => {
+  const c = await runCase({
+    failedId: '98124',
+    windowMs: 1_500,
+    maxMs: 8_000,
+    afterPublish: (add) => setTimeout(() => add(execution({ id: '98150', status: 'success', startedAt: iso(Date.now()), input: { channel_id: 'C1', builder_id: 'U1' } })), 3_000),
+  });
+  try {
+    const first = await c.dashboard.until((b) => b.repair_id === `REP-${WF}-98124`);
+    assert.equal(first.outcome, 'repaired_pending');
+    const second = await c.dashboard.until((b) => b.repair_id === `REP-${WF}-98124` && b.follow_up === true);
+    assert.equal(second.outcome, 'repaired', 'the quiet first window did not end in needs_human');
+    assert.deepEqual(second.verified_by.map((r) => r.execution_id), ['98150']);
+    assert.equal(second.human_action, null);
+    assert.equal(c.dashboard.bodies.filter((b) => b.repair_id === `REP-${WF}-98124` && b.follow_up).length, 1, 'one second report only');
+  } finally {
+    await c.close();
   }
 });
